@@ -1,0 +1,4190 @@
+Wow! curve ball, after all this work, it's not all lost but our sister environments are headed to standardizing on vmware vCF9. Not all is left, but we are going to pivot and start looking at a greenfield installation of vCF9 having a management "domain segment" and workload "segment1 & dev segments".
+---
+That is a **big pivot**, but surprisingly little of the engineering work is wasted. In some ways, greenfield VMware VCF 9 gives you a cleaner place to apply what we discovered instead of trying to retrofit it into the existing `dev.local` architecture.
+
+The important conceptual change is that I would stop treating the existing environment as the architecture we must transform and start treating it as the **source of requirements and constraints** for the new environment.
+
+Your first-pass VCF 9 model sounds roughly like:
+
+```text
+                    Enterprise / Upstream
+                    Identity / PKI / DNS
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │      VCF 9          │
+                 │                     │
+                 │ Management Domain   │
+                 │ "Domain Segment"    │
+                 │                     │
+                 │ vCenter             │
+                 │ NSX                 │
+                 │ VCF Operations      │
+                 │ VCF Automation      │
+                 │ Core Infrastructure │
+                 └──────────┬──────────┘
+                            │
+                 controlled dependencies
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+       Workload Domain(s)          Workload Domain(s)
+          Segment 1                     Dev
+              │                           │
+        protected/core              development
+         workloads                   workloads
+```
+
+And this changes one of the most important things we've been wrestling with: **the management plane becomes something we can design correctly from Day 0**, rather than figuring out how to bolt MFA, identity, DNS, certificates, reverse proxies, Keycloak, privileged access, and segmentation onto an inherited VMware environment.
+
+A lot of our DAG actually survives. The nodes change, but the questions don't. DNS/TLD, PKI/sub-CA, identity authority, privileged MFA, `sa`/`da` accounts, Keycloak, network trust boundaries, HAProxy, RKE2, Day-0 recovery, service dependencies, Azure identities, OP identities, and disaster recovery are still requirements. What disappears are many of the ugly **migration-induced dependencies** created by `dev.local`, existing vCenters, legacy IdP configuration, and existing workload placement.
+
+There's also a potentially much cleaner architectural separation now:
+
+**Management Domain = infrastructure control plane.** Extremely restricted access, dedicated privileged identities/MFA, VCF/vCenter/NSX management, DNS/NTP/PKI dependencies carefully defined, and as little dependency on workload services as possible.
+
+**Segment 1 workload domain = controlled production/core services.** Keycloak, GitLab, Jira/Confluence, infrastructure applications, potentially RKE2 platform services, etc., subject to whatever security boundary we establish.
+
+**Dev workload domain = developer workloads.** Developers get the flexibility they require without their environment becoming part of the dependency chain required to operate or recover VCF itself.
+
+That also immediately brings our **Day-0/Day-1 bootstrap problem** back to center stage. We should deliberately identify what VCF needs before things such as Keycloak, RKE2, GitLab, AAP, DNS automation, HAProxy, etc. are available. That was already emerging from our dependency analysis, but now we can design it rather than discover it after deployment.
+
+One thing I would *not* do yet is start drawing the final VCF architecture. First I would build a **VCF 9 greenfield foundation DAG**. Something like:
+
+```text
+Organization / Security Requirements
+                │
+                ▼
+       Naming / TLD Strategy
+                │
+        ┌───────┴────────┐
+        ▼                ▼
+       DNS              PKI
+        │                │
+        └───────┬────────┘
+                ▼
+       Network Boundaries
+                │
+       ┌────────┼─────────┐
+       ▼        ▼         ▼
+ Management  Segment1    Dev
+  Network     Network   Network
+       │
+       ▼
+   VCF 9 Foundation
+       │
+       ├── Management Domain
+       ├── Identity
+       ├── Privileged Access/MFA
+       ├── vCenter
+       ├── NSX
+       ├── Operations
+       └── Recovery/Backup
+                │
+                ▼
+       Workload Domains
+          ┌─────┴─────┐
+          ▼           ▼
+       Segment1       Dev
+          │           │
+          ▼           ▼
+     Core Services   Dev Services
+```
+
+Then we can ask the question that the previous architecture made extremely difficult:
+
+> **If everything is gone and we have racks of powered-off servers, network connectivity, installation media, and credentials, what is the exact dependency order required to rebuild the enterprise?**
+
+That is going to expose whether DNS, PKI, AD, RSA, Keycloak, HAProxy, VCF, RKE2, AAP, GitLab, etc. are sitting at the correct layer.
+
+And I think there's an even bigger opportunity here: **don't copy the old `Domain → Segment1 → Dev` implementation into VCF simply because those are the security zones you have today.** Preserve the *security requirements* of those zones, but let VCF 9/NSX architecture determine how those requirements should actually be implemented in the greenfield design.
+
+So yes—curve ball, but a pretty useful one. The months we've spent untangling identity, MFA, PKI, DNS, segmentation, dependency order, RKE2, HAProxy and recovery have essentially produced the **requirements discovery exercise for the greenfield VCF architecture**.
+
+---
+
+Yes — with one important refinement: **VCF 9 gives you a unified management plane, but it does not collapse everything into one vCenter.**
+
+In VCF 9, the hierarchy is roughly:
+
+```text
+                    VCF Private Cloud
+                           │
+                        VCF Fleet
+                           │
+                    VCF Operations
+                Unified management plane
+                           │
+                 ┌─────────┴─────────┐
+                 │                   │
+            VCF Instance        VCF Instance
+                 │
+        ┌────────┴───────────┐
+        │                    │
+ Management Domain      VI Workload Domains
+        │                 │          │
+        │                 │          │
+    vCenter-MGMT     vCenter-S1   vCenter-DEV
+        │                 │          │
+ Management ESXi     Segment1     Development
+   clusters          clusters       clusters
+```
+
+Each **workload domain still has its own vCenter**. A VCF instance has exactly one management domain, and additional VI workload domains can be created for different workload types. VCF Operations sits above those domains and provides fleet-level management. ([VMware Blogs][1])
+
+VCF 9 also introduced the newer **vCenter Linking** architecture. Rather than relying on the old Enhanced Linked Mode replication model, VCF Operations can group vCenters and provide a unified vSphere Client experience while the individual vCenters remain independent. ([VMware Blogs][2])
+
+So for **your architecture**, I'd start thinking about it as:
+
+```text
+                       VCF 9
+                  VCF Operations
+                 "single pane/view"
+                        │
+         ┌──────────────┼──────────────┐
+         │              │              │
+         ▼              ▼              ▼
+   MGMT vCenter    SEG1 vCenter    DEV vCenter
+         │              │              │
+         ▼              ▼              ▼
+   Management       Segment 1         Dev
+    Domain           Workload       Workload
+                      Domain         Domain
+```
+
+That distinction matters because **Segment1 and Dev don't necessarily mean VLANs/segments inside one giant vCenter**. They could become actual VCF VI workload domains, each with its own vCenter and lifecycle boundary. VMware explicitly describes workload domains as a mechanism for separating workload types, with each domain having its own vCenter. ([VMware Blogs][1])
+
+### And RKE2/Rancher fits just fine conceptually
+
+Your decision to use **RKE2 + Rancher instead of Tanzu/vSphere Supervisor** actually makes the mental model simpler.
+
+I'd initially treat Kubernetes as a **consumer of VCF infrastructure**, not part of the VCF control plane:
+
+```text
+                     VCF 9
+                       │
+              Infrastructure Layer
+                       │
+        ┌──────────────┴──────────────┐
+        │                             │
+   Segment1 WLD                    Dev WLD
+        │                             │
+   ESXi / vSphere                 ESXi / vSphere
+        │                             │
+   RKE2 VMs                       RKE2 VMs
+        │                             │
+   RKE2 Cluster                   RKE2 Cluster
+        │                             │
+       Rancher  ──────────────────────┘
+```
+
+VCF owns the **physical/virtual infrastructure lifecycle**:
+
+**ESXi → vCenter → NSX → storage → workload domains → VM infrastructure**
+
+while your platform stack owns:
+
+**RHEL/Ubuntu VMs → RKE2 → Rancher → Kubernetes workloads → GitOps/application lifecycle**
+
+That preserves the architecture we've already been developing rather nicely.
+
+And there is another subtle but important implication for the DAG we've been working on:
+
+```text
+Hardware
+   │
+Network
+   │
+DNS / NTP / PKI bootstrap
+   │
+VCF Management Domain
+   │
+VCF Operations / vCenter / NSX
+   │
+VI Workload Domains
+   │
+VM Infrastructure
+   │
+RKE2
+   │
+Rancher
+   │
+Kubernetes Platform Services
+   │
+Applications
+```
+
+**RKE2 is now clearly downstream of VCF.**
+
+That means we should be careful about putting anything required to **recover VCF itself** exclusively inside RKE2. Otherwise we create:
+
+```text
+VCF
+ ↓
+RKE2
+ ↓
+Critical Service
+ ↓
+required to recover VCF
+ ↑
+ └──────── circular dependency
+```
+
+That is exactly the kind of hidden circular dependency your dependency/DAG work was starting to expose.
+
+One thing I'd investigate before we decide that `Management Domain / Segment1 WLD / Dev WLD` is the final topology is whether **Segment1 and Dev deserve separate VI workload domains or merely separate clusters/security zones within a workload domain**. That's now a real VCF architectural decision because workload-domain boundaries affect vCenter, NSX, lifecycle, failure domains, administration, and recovery—not merely network separation. ([VMware Blogs][1])
+
+Given your environment, **that is probably the first VCF 9 design decision worth analyzing**, before we worry about Keycloak or MFA. It will give us the skeleton onto which all the identity, PKI, DNS, RKE2, HAProxy and privileged-access work attaches.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/06/19/group-and-link-your-vcenter-servers-to-simplify-workload-management/?utm_source=chatgpt.com "Group and Link Your vCenter Servers to Simplify Workload Management - VMware Cloud Foundation (VCF) Blog"
+
+---
+Yes. I think this is exactly the point where you **retire the old DAG as the current-state/decision-history artifact and start a new VCF 9 greenfield DAG**.
+
+The reason is important: the old DAG was largely answering **“How do we transform this inherited architecture without breaking everything?”** The new DAG should answer **“Given the decisions already made, what must exist, and in what dependency order, to build the target architecture?”** Those are fundamentally different graphs.
+
+I would treat yesterday's decisions as **root assumptions**, not things the new DAG keeps reopening:
+
+```text
+                    ┌─────────────────────────┐
+                    │ Enterprise Direction    │
+                    │ VCF 9 + IaC             │
+                    └────────────┬────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │ Greenfield VCF 9        │
+                    │ On-Prem Deployment      │
+                    └────────────┬────────────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+       Management Domain    Segment1 Workload    Dev Workload
+                                Domain              Domain
+              │                  │                  │
+              └──────────────────┼──────────────────┘
+                                 ▼
+                       Infrastructure IaC
+                                 │
+                     ┌───────────┴──────────┐
+                     ▼                      ▼
+                 RKE2/Rancher          VM Workloads
+                     │
+                     ▼
+             Platform / Applications
+```
+
+Then the **existing ESXi environment becomes an input to migration**, rather than the foundation of the architecture:
+
+```text
+Legacy Environment
+       │
+       ├── Existing ESXi hosts
+       ├── Existing VMs
+       ├── Existing networks
+       ├── Existing identities
+       ├── Existing applications
+       └── Existing data
+              │
+              ▼
+        Migration Plan
+              │
+              ▼
+       VCF 9 Target State
+```
+
+That separation is going to make your DAG dramatically cleaner.
+
+### How I'd build the new list
+
+As you start putting the decisions together, don't worry about getting them in dependency order. Just dump them on me. I can normalize them afterward.
+
+The most useful information will be things like:
+
+* **Confirmed decisions** — VCF 9, greenfield, IaC-first, RKE2/Rancher rather than Tanzu, etc.
+* **Assumptions** — available ESXi hosts, storage, networking, 10G inter-site connectivity, existing hardware reuse, etc.
+* **Decisions still required** — workload-domain boundaries, DNS architecture, PKI, identity, privileged MFA, HAProxy placement, RKE2 placement, backup/recovery, etc.
+* **Constraints** — air gap, security boundaries, Domain/Segment1/Dev communication restrictions, Azure connectivity, certificate requirements, existing hardware, organizational mandates.
+* **Legacy things that must survive** — GitLab, Jira, Confluence, AAP, Keycloak, existing AD identities, applications, data, Terraform/Ansible workflows, and so forth.
+* **Things we might deliberately eliminate** — old vCenters, standalone Nginx proxies, `dev.local` exposure, manual configuration, infrastructure/application coupling, etc.
+
+And I would add one attribute we didn't emphasize enough in the first DAG:
+
+**Bootstrap dependency.**
+
+Every node should eventually be answerable as:
+
+```text
+Can this be built with IaC?
+        │
+        ├── YES → What executes the IaC?
+        │
+        └── NO  → Why not?
+
+What must exist before this can be built?
+
+What depends upon it afterward?
+
+Is it required for disaster recovery?
+
+If everything is dead, how is THIS component restored?
+```
+
+That becomes especially important given the parent organization's **IaC-for-everything** direction. There has to be a bottom to the automation stack. Terraform can't magically create the infrastructure running Terraform unless we've deliberately established a bootstrap mechanism.
+
+So we might ultimately discover something like:
+
+```text
+Physical Hardware
+       ↓
+Network Bootstrap
+       ↓
+DNS / NTP / PKI Bootstrap
+       ↓
+VCF Installer / Management Domain
+       ↓
+VCF Infrastructure
+       ↓
+IaC Execution Environment
+       ↓
+Terraform / Ansible / GitOps
+       ↓
+VCF Workload Domains
+       ↓
+RKE2
+       ↓
+Rancher
+       ↓
+Platform Services
+       ↓
+Applications
+```
+
+But **we should not assume that ordering yet**. The DAG should prove it.
+
+I'd also keep the previous DAG around and label it something like **`Legacy / Pre-VCF Architecture Decision DAG`**. Don't throw it away. It contains the reasoning that explains *why* decisions about identity, PKI, DNS, MFA, security boundaries, and dependency isolation exist. Those requirements remain valuable even when the implementation changes.
+
+Your new one becomes something like **`VCF9 Greenfield Foundation Dependency DAG`**.
+
+And yes: **start dumping the key decisions as you uncover them—even messy notes are fine.** Once there's enough material, we can turn them into `Confirmed / Assumed / Decision Required / Constraint / Dependency`, assign IDs, establish upstream/downstream relationships, and generate the first clean VCF 9 DAG. From there, it can become the foundation for the IaC implementation backlog rather than merely an architecture picture.
+
+---
+One concept I want to explore is that you keep referencing the domain/segment1/dev that we have when talking about vcf9. We have been working with in this air-gapped system for 12 years due to governing body requirements for security, that being domain (tightly controlled), segment1 (pretty controlled), dev (wild wild west). Now that we have moved to a "controlled connected" model with the hybrid on-prem/Azure cloud, and the new governing body has s view of cloud-first so on-prem while always operated as a private cloud of sorts, the methodologies and functions acted like a true on-prem with very little IaC. With that it mind, does it make sense to continue with management, services, workloads domains? The services which really are few; Gitlab, Atlassian Suite, Elasticsearch, RHEL Satellite, Rocketchat, RODC for legacy dev.local which will go away or at least be minimized and restricted to the management domain. I will decide now that external (developer side and Azure side) will access services from the new TLD, not via dev.local. 
+---
+Yes. And I think you've just identified a **more fundamental pivot than merely “replace vSphere with VCF 9.”**
+
+The question should no longer be, *“How do we reproduce Domain / Segment1 / Dev inside VCF?”* Those zones were an implementation of the old security model. The new question is:
+
+> **What isolation, trust, management, and workload boundaries does the new controlled-connected private cloud actually require?**
+
+VCF 9 is explicitly designed around a cloud operating model, with workload domains separating workload types and NSX/VPC constructs providing isolation and delegated governance beneath that. ([VMware Blogs][1])
+
+### I would start with three *functional* concepts, not the old security-zone names
+
+```text
+                         VCF 9 Private Cloud
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+             MANAGEMENT PLANE        WORKLOAD PLANE
+                    │                       │
+          Management Domain          VI Workload Domain(s)
+                    │                       │
+          ┌─────────┴───────┐       ┌──────┴───────────────┐
+          │                 │       │                      │
+     VCF / vCenter       Critical   Shared Platform     Developer /
+     NSX / Ops           Infra      Services            App Workloads
+     Automation          Services       │                      │
+          │                 │           │                      │
+          │                 │        GitLab                RKE2 VMs
+          │                 │        Atlassian             Applications
+          │                 │        Elastic               Test VMs
+          │                 │        Satellite             IaC-created VMs
+          │                 │        Rocket.Chat
+          │                 │
+          │             Legacy RODC
+          │             if required
+          │
+          └──── infrastructure administration only
+```
+
+But there's an important distinction: **“Management / Services / Workloads” does not automatically mean three VCF workload domains.**
+
+VCF gives us several levels at which to create boundaries: VCF instance → workload domain → vCenter → cluster → NSX Project/VPC → network segment → firewall policy. A workload domain is a relatively heavyweight architectural boundary because each one gets its own vCenter and lifecycle characteristics. ([VMware Blogs][1])
+
+So I'd make **Management / Services / Workloads logical architecture classifications first**. Then the DAG/design process determines whether Services deserves its own VI workload domain.
+
+### Your new TLD decision is significant
+
+What you just decided eliminates a major piece of the legacy architecture:
+
+```text
+OLD
+
+Developer ──► *.dev.local ──► Service
+Azure     ──► ???           ──► Service
+Domain    ──► *.dev.local   ──► Service
+```
+
+becomes conceptually:
+
+```text
+NEW
+
+               New Enterprise TLD
+                      │
+        ┌─────────────┼─────────────┐
+        │             │             │
+      Azure       Developer     Management
+        │             │             │
+        └─────────────┼─────────────┘
+                      ▼
+              Controlled Service
+                 Entry Points
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       GitLab      Atlassian    Rocket.Chat
+                               / other services
+```
+
+`dev.local` therefore stops being an **enterprise service namespace**.
+
+That's a very useful foundation decision.
+
+I'd phrase it in the new DAG/register as:
+
+**FND-NAME-001 — External Service Namespace**
+
+> All services consumed by developer, controlled-connected, or Azure users will be exposed through the new enterprise-approved TLD. `dev.local` will not be used as a client-facing namespace for newly deployed services. Legacy `dev.local` dependencies will be isolated and reduced during migration.
+
+That means you don't necessarily have to solve **“How do we kill dev.local?”** before VCF. You can solve:
+
+**“How do we prevent the new architecture from depending upon dev.local?”**
+
+That's a much easier problem.
+
+### I'd also reconsider what belongs in the Management Domain
+
+One small place I'd challenge your wording is putting the legacy RODC *in the management domain* merely because it's legacy.
+
+The VCF management domain is special: VCF's first cluster hosts the core management components, and VMware treats it as the management infrastructure for the VCF instance. ([VMware Blogs][1])
+
+I'd apply a strict test:
+
+```text
+               Does VCF require this service
+                 to operate/recover?
+                         │
+                ┌────────┴────────┐
+               YES               NO
+                │                 │
+                ▼                 ▼
+        Candidate for       Keep OUT of
+        Management Plane    Management Domain
+```
+
+So things like:
+
+```text
+VCF Operations
+VCF Automation
+vCenter
+NSX
+DNS needed by VCF
+NTP needed by VCF
+PKI dependencies
+IaC bootstrap components
+possibly identity required for administration
+```
+
+deserve investigation for management-plane placement.
+
+Whereas:
+
+```text
+GitLab
+Jira
+Confluence
+Elastic
+Rocket.Chat
+Developer RODC
+RKE2 application clusters
+normal application VMs
+```
+
+probably should **not** live there simply because they're infrastructure-ish.
+
+Satellite is an interesting one. So is whatever eventually hosts your Git/IaC source of truth. Those need dependency analysis rather than an immediate placement decision.
+
+### And this may eliminate "Dev" as an infrastructure boundary
+
+This is perhaps the biggest conceptual change.
+
+Historically:
+
+```text
+DOMAIN        SEGMENT1          DEV
+  │              │              │
+High Trust    Medium Trust    Low Trust
+  │              │              │
+Infrastructure dictated by security zone
+```
+
+The VCF/NSX model lets you potentially move toward:
+
+```text
+                  PRIVATE CLOUD
+                       │
+              Enterprise Guardrails
+                       │
+           ┌───────────┴───────────┐
+           │                       │
+       PLATFORM                 TENANTS
+           │                       │
+     Shared Services       ┌───────┼────────┐
+                           │       │        │
+                         Team A  Team B   Team C
+                           │       │        │
+                         VPC     VPC      VPC
+                           │       │        │
+                      Developer autonomy
+                      within guardrails
+```
+
+VCF 9's VPC architecture is explicitly intended to provide that sort of model: enterprise/network administrators establish governance and connectivity while project/VPC administrators can be delegated control within those boundaries. ([VMware Blogs][2])
+
+That sounds **much closer to what your developers actually need** than recreating the Wild Wild West Dev network.
+
+You don't necessarily eliminate the *security classification*. You eliminate the assumption that:
+
+> **security classification = physical/network architecture = vCenter boundary = administrative boundary.**
+
+Those can now be separate decisions.
+
+---
+
+So I'd make an adjustment to what I said previously about our new DAG.
+
+**Don't start the new DAG with:**
+
+```text
+Management Domain
+      │
+Segment1 Domain
+      │
+Dev Domain
+```
+
+That prematurely carries twelve years of architecture into the greenfield.
+
+Start it more like:
+
+```text
+                 GOVERNING REQUIREMENTS
+                          │
+                          ▼
+                 VCF 9 PRIVATE CLOUD
+                          │
+        ┌─────────────────┼─────────────────┐
+        │                 │                 │
+        ▼                 ▼                 ▼
+   MANAGEMENT          SERVICES          WORKLOADS
+      PLANE              PLANE              PLANE
+        │                 │                 │
+        │                 │           ┌─────┴─────┐
+        │                 │           │           │
+        │                 │       Controlled   Developer
+        │                 │        Workloads   Workloads
+        │                 │
+        └─────────────────┼─────────────────────────
+                          │
+                  Security / NSX / VPC
+                    Policy Boundaries
+                          │
+                   Enterprise TLD
+                          │
+                   Identity / PKI
+                          │
+                    Azure / On-Prem
+```
+
+Then one of the DAG's **Decision Required** nodes becomes:
+
+> **FND-VCF-xxx: Which logical boundaries require dedicated VCF VI workload domains, which require dedicated clusters, and which can be implemented as NSX Projects/VPCs/security boundaries?**
+
+That is a much better greenfield architecture question.
+
+And your decision today about **new-TLD-only service consumption from developer/Azure clients** should absolutely go into the foundation decisions. It effectively draws a line in the sand: **`dev.local` becomes legacy compatibility infrastructure rather than a design constraint for the future private cloud.**
+
+That distinction is going to simplify DNS, PKI, Keycloak, HAProxy, service migration, Azure interoperability, and eventually the retirement of the RODC substantially. ([VMware Blogs][3])
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/07/02/vmware-virtual-private-cloud/?utm_source=chatgpt.com "VMware Virtual Private Cloud in VMware Cloud Foundation 9.0: A New Era of Private Cloud Networking - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2026/02/06/why-vcf-9-0-improves-it-operations-and-management/?utm_source=chatgpt.com "Why VCF 9.0 Improves IT Operations and Management - VMware Cloud Foundation (VCF) Blog"
+---
+I start reading through the explanation and forget 1 whole user population.. . currently on-prem only users (500-700) currently login to dev.local from their thick/thin clients to dev.local using their troll name from machines that are connected to the legacy "domain" segment. To me it's logical to start moving these accounts to a first.last.<type>@<newTLD> as a phased approach to get to an eventual common UID with cloud, at least it would be in the same format, ultimately the PKI solution for all is further down the road than the current pivot to vcf9. If we are going to transition to workload domains, it makes sense to me to have the on-prem users transition to logging in with the new format. And now that said that, for planning purposes, let's keep with the new TLD an call it tc.org, that AD would it also be in the vcf9 "management" domain? I don't know how versed our security team is in vcf9/cloud concepts so I need to understand it so I can explain it to the security manager simply.
+---
+Yes — and I would separate **two concepts that sound similar but are actually very different**:
+
+1. **The new `tc.org` Active Directory / identity domain**
+2. **The VCF 9 Management Domain**
+
+I would **not automatically put the `tc.org` domain controllers inside the VCF Management Domain**. That's one of the first architecture decisions I would put into the new DAG.
+
+### First, your on-prem user idea makes sense as a target direction
+
+You just filled in the missing population:
+
+```text
+TODAY
+
+On-Prem Users (500–700)
+        │
+        │ trollname + password/MFA
+        ▼
+    dev.local AD
+        │
+        ▼
+Domain-attached thick/thin clients
+```
+
+Rather than carry that identity model indefinitely, the greenfield program gives you an opportunity to move toward:
+
+```text
+TARGET DIRECTION
+
+On-Prem                         Azure
+  │                               │
+  │ first.last.<type>@tc.org      │ existing cloud identity
+  │                               │
+  └──────────────┬────────────────┘
+                 │
+          Common Identity
+             Convention
+                 │
+            eventually
+                 │
+         Common UID / PKI
+```
+
+I like an important part of your wording: **“phased approach.”**
+
+Changing the username format does *not* magically give you common identity. But it removes one of the structural obstacles to getting there.
+
+So I would record this as a foundation decision along the lines of:
+
+> **New on-prem identities will move toward the enterprise `tc.org` namespace and a common naming convention compatible with the future cloud/common-UID model. Existing `dev.local` troll-name identities will be treated as legacy identities and transitioned in phases.**
+
+That's different from saying *“we're migrating AD tomorrow.”* The latter requires considerably more design.
+
+And your other decision fits directly beside it:
+
+> **New enterprise services will be exposed through `tc.org`; `dev.local` will not be the service-consumption namespace for Azure or developer-facing services.**
+
+There's another reason I'm increasingly comfortable with that direction: VMware is itself pushing VCF 9 away from `.local` for newer components. In particular, VCF Identity Broker and VCF Automation no longer support `.local`, although some core components retain compatibility. ([VMware Blogs][1])
+
+---
+
+## But `tc.org AD` ≠ `VCF Management Domain`
+
+This terminology is going to be **very important when you talk to Security**.
+
+When VMware says:
+
+> **Management Domain**
+
+it does **not** mean:
+
+> Windows/Active Directory domain where administrators live.
+
+A VCF Management Domain is a **VCF infrastructure construct**. The first vSphere cluster of a VCF instance becomes its Management Domain and hosts the core VCF management components. Additional VI workload domains then host workloads. ([VMware Blogs][2])
+
+I would explain it to your security manager this way:
+
+> **The VCF Management Domain is the secure control plane of the private cloud. It isn't our Windows domain. It's where the systems that control the cloud live.**
+
+That's probably the simplest explanation.
+
+Conceptually:
+
+```text
+                     tc.org
+                Enterprise Identity
+                       │
+              ┌────────┴────────┐
+              │                 │
+       On-Prem Users       Azure Users
+              │                 │
+              └────────┬────────┘
+                       │
+                Identity / SSO
+                       │
+                       ▼
+            ┌─────────────────────┐
+            │ VCF MANAGEMENT      │
+            │ DOMAIN              │
+            │                     │
+            │ "Control Plane"     │
+            │                     │
+            │ VCF Management      │
+            │ vCenter             │
+            │ NSX                 │
+            │ VCF Operations      │
+            │ VCF Automation      │
+            └──────────┬──────────┘
+                       │
+                       │ controls
+                       ▼
+            ┌─────────────────────┐
+            │ WORKLOAD DOMAINS    │
+            │                     │
+            │ Services            │
+            │ RKE2/Rancher        │
+            │ Application VMs     │
+            │ Developer VMs       │
+            │ etc.                │
+            └─────────────────────┘
+```
+
+VCF 9 actually reinforces this separation because VCF's Identity Broker provides centralized administrative SSO to VCF Operations, vSphere Client, NSX Manager and other management interfaces. ([VMware Blogs][3])
+
+Also noteworthy for our design: vCenter 9 no longer supports directly joining the vCenter appliance to AD using Integrated Windows Authentication. Broadcom directs customers toward alternatives such as LDAPS or federated identity. 
+
+So we shouldn't think:
+
+```text
+tc.org AD
+   │
+   └── VCF belongs to this Windows domain
+```
+
+as we would have historically.
+
+Think:
+
+```text
+tc.org Identity
+       │
+       │ authenticates authorized administrators
+       ▼
+VCF Identity / SSO
+       │
+       ▼
+VCF Control Plane
+```
+
+That is a much more cloud-like model.
+
+---
+
+## So where do the `tc.org` domain controllers live?
+
+**This is where I would deliberately leave a DAG node marked `DECISION REQUIRED`.**
+
+My initial architectural inclination would be **not to make your enterprise AD entirely dependent upon the VCF Management Domain that consumes it.**
+
+Otherwise you can accidentally construct:
+
+```text
+tc.org AD
+    ↓
+VCF authentication
+    ↓
+VCF Management Domain
+    ↓
+VMware hosting
+    ↓
+tc.org AD
+```
+
+That's a circular bootstrap/recovery dependency.
+
+It doesn't mean DCs can't be virtualized — VMware explicitly supports virtualized AD DS and describes DC workloads as a good fit for VMs. ([VMware][4])
+
+The question is **where and how many**.
+
+For example, we may eventually determine that the architecture should look more like:
+
+```text
+                    ENTERPRISE FOUNDATION
+
+                  DNS / NTP / PKI / Identity
+                         tc.org AD
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+                 ▼                       ▼
+          VCF Control Plane        Azure / Enterprise
+                 │
+                 ▼
+        ┌──────────────────┐
+        │ VCF Management   │
+        │ Domain           │
+        └────────┬─────────┘
+                 │
+        ┌────────┴─────────┐
+        │                  │
+        ▼                  ▼
+    Services            Workloads
+        │                  │
+ GitLab/Atlassian      RKE2 / VMs
+ Satellite/Elastic     Dev workloads
+ etc.
+```
+
+The exact placement of DNS, AD, PKI, RSA, IaC bootstrap, etc. should come out of our **failure/recovery analysis**, rather than us prematurely deciding they're management-domain workloads.
+
+---
+
+# And I think we've found our new security model
+
+This is probably the biggest thing I'd communicate to your security manager.
+
+The old model was essentially:
+
+```text
+SECURITY = WHERE YOU ARE
+
+DOMAIN
+  ↓
+Very trusted
+
+SEGMENT1
+  ↓
+Controlled
+
+DEV
+  ↓
+Wild West
+```
+
+After twelve years, everyone understandably thinks in those terms.
+
+The greenfield VCF model gives you the opportunity to say:
+
+```text
+SECURITY = WHO + WHAT + POLICY
+```
+
+instead of simply:
+
+```text
+SECURITY = WHICH NETWORK
+```
+
+You can still have extremely strong segmentation. We're **not proposing less security**.
+
+We're proposing that the security boundary no longer has to dictate the entire infrastructure architecture.
+
+For example:
+
+```text
+                     VCF PRIVATE CLOUD
+                            │
+           ┌────────────────┼────────────────┐
+           │                │                │
+     MANAGEMENT          SERVICES        WORKLOADS
+           │                │                │
+    Infrastructure       Enterprise       Projects /
+      control             services        Applications
+           │                │                │
+       VERY HIGH        CONTROLLED      POLICY BASED
+       SECURITY          SECURITY        ISOLATION
+           │                │                │
+           └────────────────┼────────────────┘
+                            │
+                         NSX/VPC
+                    security policies
+                            │
+                     Identity / RBAC
+                            │
+                          tc.org
+```
+
+A developer doesn't get access because their workstation happens to sit on the **Dev network**.
+
+They get access because:
+
+```text
+Identity
+   +
+Role
+   +
+Device / authentication
+   +
+Network policy
+   +
+Application authorization
+   =
+Access
+```
+
+That is a much easier conceptual bridge to the cloud-first model your new governing organization is pushing.
+
+And it doesn't require waiting for the final PKI architecture. You can establish the **identity namespace, trust boundaries and authorization architecture now**, while authentication strength evolves later.
+
+---
+
+### One thing I would change from our previous DAG thinking
+
+I don't think our top-level nodes should even be:
+
+**Management → Services → Workloads**
+
+yet.
+
+I'd go one level higher:
+
+```text
+                    VCF9 GREENFIELD
+                         │
+       ┌─────────────────┼──────────────────┐
+       │                 │                  │
+   IDENTITY          PLATFORM          SECURITY
+       │                 │                  │
+    tc.org          VCF 9 Fleet        Trust Model
+    Users           Management         Segmentation
+    UID             Workloads          RBAC
+    PKI             RKE2/Rancher       MFA
+       │                 │                  │
+       └─────────────────┼──────────────────┘
+                         │
+                    AUTOMATION
+                         │
+                  IaC / Git / AAP
+                         │
+                         ▼
+                     SERVICES
+                         │
+              GitLab / Atlassian /
+             Elastic / Satellite /
+                 Rocket.Chat
+                         │
+                         ▼
+                     CONSUMERS
+                  ┌──────┼──────┐
+               On-Prem  Azure  Developers
+```
+
+Then **VCF workload-domain placement becomes a consequence of the requirements**, rather than the starting assumption.
+
+That's where I think the new DAG should begin.
+
+And we now have at least **four genuine foundation decisions** already: VCF 9 greenfield; IaC-first; new services use `tc.org` rather than `dev.local`; and on-prem identity begins a phased transition away from troll-name/`dev.local` toward the common `tc.org` naming model. Those are strong enough to start building the new dependency tree around.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2026/04/17/bridging-the-local-gap-a-split-domain-design-for-vmware-cloud-foundation-deployment/?utm_source=chatgpt.com "Bridging the (.Local) Gap: A Split-Domain Design for VMware Cloud Foundation Deployment - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2025/06/19/streamline-administrative-access-with-vcf-single-sign-on/?utm_source=chatgpt.com "Streamline Administrative Access with VMware Cloud Foundation Single Sign-On - VMware Cloud Foundation (VCF) Blog"
+[4]: https://www.vmware.com/docs/active-directory-domain-services-vcf?utm_source=chatgpt.com "Virtualizing Active Directory Domain Services on VMware Cloud Foundation"
+
+---
+Yes — and I would separate **two concepts that sound similar but are actually very different**:
+
+1. **The new `tc.org` Active Directory / identity domain**
+2. **The VCF 9 Management Domain**
+
+I would **not automatically put the `tc.org` domain controllers inside the VCF Management Domain**. That's one of the first architecture decisions I would put into the new DAG.
+
+### First, your on-prem user idea makes sense as a target direction
+
+You just filled in the missing population:
+
+```text
+TODAY
+
+On-Prem Users (500–700)
+        │
+        │ trollname + password/MFA
+        ▼
+    dev.local AD
+        │
+        ▼
+Domain-attached thick/thin clients
+```
+
+Rather than carry that identity model indefinitely, the greenfield program gives you an opportunity to move toward:
+
+```text
+TARGET DIRECTION
+
+On-Prem                         Azure
+  │                               │
+  │ first.last.<type>@tc.org      │ existing cloud identity
+  │                               │
+  └──────────────┬────────────────┘
+                 │
+          Common Identity
+             Convention
+                 │
+            eventually
+                 │
+         Common UID / PKI
+```
+
+I like an important part of your wording: **“phased approach.”**
+
+Changing the username format does *not* magically give you common identity. But it removes one of the structural obstacles to getting there.
+
+So I would record this as a foundation decision along the lines of:
+
+> **New on-prem identities will move toward the enterprise `tc.org` namespace and a common naming convention compatible with the future cloud/common-UID model. Existing `dev.local` troll-name identities will be treated as legacy identities and transitioned in phases.**
+
+That's different from saying *“we're migrating AD tomorrow.”* The latter requires considerably more design.
+
+And your other decision fits directly beside it:
+
+> **New enterprise services will be exposed through `tc.org`; `dev.local` will not be the service-consumption namespace for Azure or developer-facing services.**
+
+There's another reason I'm increasingly comfortable with that direction: VMware is itself pushing VCF 9 away from `.local` for newer components. In particular, VCF Identity Broker and VCF Automation no longer support `.local`, although some core components retain compatibility. ([VMware Blogs][1])
+
+---
+
+## But `tc.org AD` ≠ `VCF Management Domain`
+
+This terminology is going to be **very important when you talk to Security**.
+
+When VMware says:
+
+> **Management Domain**
+
+it does **not** mean:
+
+> Windows/Active Directory domain where administrators live.
+
+A VCF Management Domain is a **VCF infrastructure construct**. The first vSphere cluster of a VCF instance becomes its Management Domain and hosts the core VCF management components. Additional VI workload domains then host workloads. ([VMware Blogs][2])
+
+I would explain it to your security manager this way:
+
+> **The VCF Management Domain is the secure control plane of the private cloud. It isn't our Windows domain. It's where the systems that control the cloud live.**
+
+That's probably the simplest explanation.
+
+Conceptually:
+
+```text
+                     tc.org
+                Enterprise Identity
+                       │
+              ┌────────┴────────┐
+              │                 │
+       On-Prem Users       Azure Users
+              │                 │
+              └────────┬────────┘
+                       │
+                Identity / SSO
+                       │
+                       ▼
+            ┌─────────────────────┐
+            │ VCF MANAGEMENT      │
+            │ DOMAIN              │
+            │                     │
+            │ "Control Plane"     │
+            │                     │
+            │ VCF Management      │
+            │ vCenter             │
+            │ NSX                 │
+            │ VCF Operations      │
+            │ VCF Automation      │
+            └──────────┬──────────┘
+                       │
+                       │ controls
+                       ▼
+            ┌─────────────────────┐
+            │ WORKLOAD DOMAINS    │
+            │                     │
+            │ Services            │
+            │ RKE2/Rancher        │
+            │ Application VMs     │
+            │ Developer VMs       │
+            │ etc.                │
+            └─────────────────────┘
+```
+
+VCF 9 actually reinforces this separation because VCF's Identity Broker provides centralized administrative SSO to VCF Operations, vSphere Client, NSX Manager and other management interfaces. ([VMware Blogs][3])
+
+Also noteworthy for our design: vCenter 9 no longer supports directly joining the vCenter appliance to AD using Integrated Windows Authentication. Broadcom directs customers toward alternatives such as LDAPS or federated identity. 
+
+So we shouldn't think:
+
+```text
+tc.org AD
+   │
+   └── VCF belongs to this Windows domain
+```
+
+as we would have historically.
+
+Think:
+
+```text
+tc.org Identity
+       │
+       │ authenticates authorized administrators
+       ▼
+VCF Identity / SSO
+       │
+       ▼
+VCF Control Plane
+```
+
+That is a much more cloud-like model.
+
+---
+
+## So where do the `tc.org` domain controllers live?
+
+**This is where I would deliberately leave a DAG node marked `DECISION REQUIRED`.**
+
+My initial architectural inclination would be **not to make your enterprise AD entirely dependent upon the VCF Management Domain that consumes it.**
+
+Otherwise you can accidentally construct:
+
+```text
+tc.org AD
+    ↓
+VCF authentication
+    ↓
+VCF Management Domain
+    ↓
+VMware hosting
+    ↓
+tc.org AD
+```
+
+That's a circular bootstrap/recovery dependency.
+
+It doesn't mean DCs can't be virtualized — VMware explicitly supports virtualized AD DS and describes DC workloads as a good fit for VMs. ([VMware][4])
+
+The question is **where and how many**.
+
+For example, we may eventually determine that the architecture should look more like:
+
+```text
+                    ENTERPRISE FOUNDATION
+
+                  DNS / NTP / PKI / Identity
+                         tc.org AD
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+                 ▼                       ▼
+          VCF Control Plane        Azure / Enterprise
+                 │
+                 ▼
+        ┌──────────────────┐
+        │ VCF Management   │
+        │ Domain           │
+        └────────┬─────────┘
+                 │
+        ┌────────┴─────────┐
+        │                  │
+        ▼                  ▼
+    Services            Workloads
+        │                  │
+ GitLab/Atlassian      RKE2 / VMs
+ Satellite/Elastic     Dev workloads
+ etc.
+```
+
+The exact placement of DNS, AD, PKI, RSA, IaC bootstrap, etc. should come out of our **failure/recovery analysis**, rather than us prematurely deciding they're management-domain workloads.
+
+---
+
+# And I think we've found our new security model
+
+This is probably the biggest thing I'd communicate to your security manager.
+
+The old model was essentially:
+
+```text
+SECURITY = WHERE YOU ARE
+
+DOMAIN
+  ↓
+Very trusted
+
+SEGMENT1
+  ↓
+Controlled
+
+DEV
+  ↓
+Wild West
+```
+
+After twelve years, everyone understandably thinks in those terms.
+
+The greenfield VCF model gives you the opportunity to say:
+
+```text
+SECURITY = WHO + WHAT + POLICY
+```
+
+instead of simply:
+
+```text
+SECURITY = WHICH NETWORK
+```
+
+You can still have extremely strong segmentation. We're **not proposing less security**.
+
+We're proposing that the security boundary no longer has to dictate the entire infrastructure architecture.
+
+For example:
+
+```text
+                     VCF PRIVATE CLOUD
+                            │
+           ┌────────────────┼────────────────┐
+           │                │                │
+     MANAGEMENT          SERVICES        WORKLOADS
+           │                │                │
+    Infrastructure       Enterprise       Projects /
+      control             services        Applications
+           │                │                │
+       VERY HIGH        CONTROLLED      POLICY BASED
+       SECURITY          SECURITY        ISOLATION
+           │                │                │
+           └────────────────┼────────────────┘
+                            │
+                         NSX/VPC
+                    security policies
+                            │
+                     Identity / RBAC
+                            │
+                          tc.org
+```
+
+A developer doesn't get access because their workstation happens to sit on the **Dev network**.
+
+They get access because:
+
+```text
+Identity
+   +
+Role
+   +
+Device / authentication
+   +
+Network policy
+   +
+Application authorization
+   =
+Access
+```
+
+That is a much easier conceptual bridge to the cloud-first model your new governing organization is pushing.
+
+And it doesn't require waiting for the final PKI architecture. You can establish the **identity namespace, trust boundaries and authorization architecture now**, while authentication strength evolves later.
+
+---
+
+### One thing I would change from our previous DAG thinking
+
+I don't think our top-level nodes should even be:
+
+**Management → Services → Workloads**
+
+yet.
+
+I'd go one level higher:
+
+```text
+                    VCF9 GREENFIELD
+                         │
+       ┌─────────────────┼──────────────────┐
+       │                 │                  │
+   IDENTITY          PLATFORM          SECURITY
+       │                 │                  │
+    tc.org          VCF 9 Fleet        Trust Model
+    Users           Management         Segmentation
+    UID             Workloads          RBAC
+    PKI             RKE2/Rancher       MFA
+       │                 │                  │
+       └─────────────────┼──────────────────┘
+                         │
+                    AUTOMATION
+                         │
+                  IaC / Git / AAP
+                         │
+                         ▼
+                     SERVICES
+                         │
+              GitLab / Atlassian /
+             Elastic / Satellite /
+                 Rocket.Chat
+                         │
+                         ▼
+                     CONSUMERS
+                  ┌──────┼──────┐
+               On-Prem  Azure  Developers
+```
+
+Then **VCF workload-domain placement becomes a consequence of the requirements**, rather than the starting assumption.
+
+That's where I think the new DAG should begin.
+
+And we now have at least **four genuine foundation decisions** already: VCF 9 greenfield; IaC-first; new services use `tc.org` rather than `dev.local`; and on-prem identity begins a phased transition away from troll-name/`dev.local` toward the common `tc.org` naming model. Those are strong enough to start building the new dependency tree around.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2026/04/17/bridging-the-local-gap-a-split-domain-design-for-vmware-cloud-foundation-deployment/?utm_source=chatgpt.com "Bridging the (.Local) Gap: A Split-Domain Design for VMware Cloud Foundation Deployment - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2025/06/19/streamline-administrative-access-with-vcf-single-sign-on/?utm_source=chatgpt.com "Streamline Administrative Access with VMware Cloud Foundation Single Sign-On - VMware Cloud Foundation (VCF) Blog"
+[4]: https://www.vmware.com/docs/active-directory-domain-services-vcf?utm_source=chatgpt.com "Virtualizing Active Directory Domain Services on VMware Cloud Foundation"
+
+---
+
+Yes. And keep asking it from different angles. You're not really asking the same question repeatedly; you're **replacing a 12-year mental model with a different operating model**, and each pass tests whether the new model still makes sense from another direction.
+
+What you just described about the governing body's policy actually makes the VCF 9 pivot make considerably more sense to me.
+
+I think their conceptual model is something close to this:
+
+```text
+                         ┌─────────────────────────────┐
+                         │      MISSION / OBJECTIVE    │
+                         │   What must be accomplished │
+                         └──────────────▲──────────────┘
+                                        │
+                         ┌──────────────┴──────────────┐
+                         │     APPLICATION / SERVICE   │
+                         │ What provides the capability│
+                         └──────────────▲──────────────┘
+                                        │
+                         ┌──────────────┴──────────────┐
+                         │       ENTITLEMENT / RBAC    │
+                         │ Who can do what             │
+                         └──────────────▲──────────────┘
+                                        │
+                         ┌──────────────┴──────────────┐
+                         │     IDENTITY / SECURITY     │
+                         │ Who are you / trust / MFA   │
+                         └──────────────▲──────────────┘
+                                        │
+                         ┌──────────────┴──────────────┐
+                         │       PLATFORM SERVICES     │
+                         │ VCF / RKE2 / DNS / PKI etc.│
+                         └──────────────▲──────────────┘
+                                        │
+                         ┌──────────────┴──────────────┐
+                         │       INFRASTRUCTURE        │
+                         │ Compute / network / storage │
+                         └─────────────────────────────┘
+```
+
+The important part isn't necessarily those exact layers. **The dependency direction is the key.**
+
+The mission doesn't exist to support VCF.
+
+VCF exists to support the platform, which supports identity/security/entitlements, which supports services, which ultimately supports the **mission objective**.
+
+And IaC changes the question from merely:
+
+> "How do we keep all this stuff running?"
+
+to:
+
+> **"Can we deterministically reconstruct all of the supporting bricks necessary to restore the mission capability?"**
+
+That is a substantially different architecture philosophy.
+
+### Now your DAG work clicks into place
+
+This also explains why your dependency-DAG approach got such a strong reaction from the architect.
+
+The DAG is effectively the **engineering representation of that brick model**.
+
+The policy says conceptually:
+
+```text
+Foundation
+    ↓
+Brick
+    ↓
+Brick
+    ↓
+Brick
+    ↓
+Objective
+```
+
+The DAG asks the implementation-level question:
+
+```text
+What must exist before this?
+        ↓
+What does this depend upon?
+        ↓
+What depends upon this?
+        ↓
+What happens if this disappears?
+        ↓
+How is it reconstructed?
+```
+
+And then IaC provides the reconstruction mechanism.
+
+So eventually the architecture could have a very powerful relationship:
+
+```text
+              POLICY / ARCHITECTURE
+                       │
+                       ▼
+                Dependency DAG
+                       │
+            defines build ordering
+                       │
+                       ▼
+               IaC repositories
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+    Terraform       Ansible         GitOps
+        │              │              │
+        └──────────────┼──────────────┘
+                       ▼
+              Reconstructed State
+                       │
+                       ▼
+                Mission Capability
+```
+
+That makes the DAG more than documentation. It potentially becomes the **logical specification for the IaC build/recovery order**.
+
+### It also changes how I view VCF 9
+
+I wouldn't put VCF at the very bottom and call it the foundation.
+
+There's something underneath VCF:
+
+```text
+MISSION
+   ▲
+Applications
+   ▲
+Entitlements / Policy
+   ▲
+Identity / Security
+   ▲
+RKE2 / Platform Services
+   ▲
+VCF 9
+   ▲
+DNS / NTP / PKI bootstrap dependencies
+   ▲
+Network / Storage / Compute
+   ▲
+Physical Infrastructure
+```
+
+And even that is simplified.
+
+For example, VCF needs DNS. DNS may run as VMs. Those VMs might eventually run on VCF.
+
+**Boom — possible circular dependency.**
+
+That's exactly where the DAG earns its keep.
+
+We may decide that a tiny bootstrap DNS capability exists outside the normal VCF dependency chain, while the highly available production DNS architecture runs inside it. Same consideration for identity, PKI, Git/IaC tooling, NTP, secrets, etc.
+
+Those become explicit architecture decisions rather than accidental dependencies discovered during a disaster.
+
+### The cross-environment consistency is perhaps the biggest clue
+
+You said something particularly important:
+
+> **"consistently across all environments on-prem/cloud"**
+
+That suggests that **VCF isn't really the target architecture.**
+
+VCF is the on-prem implementation of a broader architecture.
+
+For example:
+
+```text
+                    COMMON ARCHITECTURE
+                           │
+              Policy / Security / Identity
+                           │
+                     Entitlements
+                           │
+                    IaC definitions
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+        ON-PREM CLOUD                AZURE CLOUD
+             │                           │
+           VCF 9                       Azure
+             │                           │
+        RKE2/Rancher                RKE2/Rancher
+             │                           │
+             └─────────────┬─────────────┘
+                           │
+                    Common Services
+                           │
+                    Common Identity
+                           │
+                    Mission Workloads
+```
+
+Not identical infrastructure.
+
+**Consistent intent, policy, identity, entitlement, deployment patterns, and reconstruction methodology.**
+
+Terraform might instantiate an NSX construct on one side and an Azure networking construct on the other. The implementations differ, but they're satisfying the same architectural requirement.
+
+That distinction is going to be extremely useful when explaining this to Security.
+
+### And this makes me rethink the new DAG one more time
+
+I would **not make `VCF9 Greenfield` the root of the DAG.**
+
+VCF is too low-level.
+
+I'd make the root something closer to:
+
+```text
+                 MISSION OBJECTIVE
+                        ▲
+                        │
+                  CAPABILITIES
+                        ▲
+                        │
+                    SERVICES
+                        ▲
+                        │
+             SECURITY / ENTITLEMENT
+                        ▲
+                        │
+              IDENTITY / TRUST
+                        ▲
+                        │
+              PLATFORM SERVICES
+                        ▲
+                        │
+              CLOUD FOUNDATION
+                 /             \
+              VCF 9            Azure
+                 \             /
+                  \           /
+                  AUTOMATION
+                        ▲
+                        │
+             PHYSICAL / CONNECTIVITY
+```
+
+We don't need those exact labels yet.
+
+In fact, **I wouldn't generate the DAG yet.** You're still discovering the governing model, and prematurely formalizing it will tempt us to make everything fit the diagram.
+
+Keep doing exactly what you're doing: throw decisions, policy concepts, populations, constraints, weird legacy requirements, security concerns, and things that suddenly occur to you into this conversation.
+
+I'll help distinguish:
+
+**“That's a foundation requirement.”**
+
+from
+
+**“That's a VCF implementation choice.”**
+
+from
+
+**“That's legacy baggage.”**
+
+from
+
+**“That's a decision we haven't actually made yet.”**
+
+Once those start settling, *then* we'll build the new DAG. And I suspect this DAG is going to be considerably better than the one we built before because we're no longer trying to reverse-engineer twelve years of accumulated infrastructure—we're designing the dependency structure **from the mission downward and the reconstruction path from the foundation upward.**
+
+---
+
+Exactly. With that additional information, I'd upgrade our "portable core" idea from a loose hypothesis to a **strong working assumption**, while leaving the unanswered bootstrap/governance pieces open.
+
+What you've actually deployed tells us quite a bit:
+
+```text
+                   ENTERPRISE CORE IaC
+                          │
+                    RKE2 Installer
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+         Deployment Profile      Cluster Profile
+              │                       │
+       VM size/category         Single / Multi-node
+              │                       │
+              └───────────┬───────────┘
+                          ▼
+                  Standard RKE2 Core
+                          │
+             ┌────────────┴────────────┐
+             ▼                         ▼
+        Azure VMs                  On-Prem VMs
+                                      │
+                                     VCF 9
+```
+
+The interesting thing is that the profiles being expressed in **Azure VM-size categories** doesn't necessarily make the platform Azure-specific. Those categories may effectively be serving as an abstract **resource profile**: "give me a node with approximately this much CPU/RAM/storage."
+
+For the VCF side, we may eventually map those profiles:
+
+```text
+Core Profile       Azure implementation       VCF implementation
+
+Small              Azure VM size A       →    vCPU/RAM/Disk profile A
+Medium             Azure VM size B       →    vCPU/RAM/Disk profile B
+Large              Azure VM size C       →    vCPU/RAM/Disk profile C
+```
+
+The RKE2 installer above that boundary doesn't particularly care whether those resources came from Azure or ESXi.
+
+And because **you have already deployed this RKE2 implementation on-prem**, that's strong evidence that this abstraction isn't merely theoretical.
+
+### This clears up something about VCF for me too
+
+I think we should stop thinking of this project primarily as:
+
+> "We're building a VCF 9 environment."
+
+It's closer to:
+
+> **"We're implementing the enterprise private-cloud substrate on VCF 9 so it can host the same IaC-defined core platform used by the cloud environments."**
+
+That's a much better architectural statement.
+
+VCF becomes one layer:
+
+```text
+                     MISSION
+                        ▲
+                  Applications
+                        ▲
+                Enterprise Core
+                        ▲
+                 RKE2 / Rancher
+                        ▲
+              Standard VM Contract
+                        ▲
+             ┌──────────┴──────────┐
+             │                     │
+        VCF 9 / On-Prem       Azure IaaS
+             ▲                     ▲
+             │                     │
+       Physical Infra        Azure Resources
+```
+
+And now "consistent across all environments" doesn't mean that Azure must look like VMware.
+
+It means **everything above that VM/substrate contract should look as similar as practical**.
+
+That's much cleaner.
+
+### It also answers part of our earlier "Services Domain" question
+
+I'm now less convinced that we should create a special VCF **Services Workload Domain** just because GitLab, Atlassian, Elastic, Rocket.Chat, etc. are "services."
+
+We should first ask:
+
+> **Are these applications part of the enterprise portable core?**
+
+If they are, their deployment architecture may be dictated by the **core platform standard**, not by a VMware organizational concept.
+
+For example, suppose we eventually learn:
+
+```text
+Enterprise Core
+      │
+      ├── RKE2
+      ├── Rancher
+      ├── GitOps
+      ├── Observability
+      ├── Identity integration
+      ├── Secrets
+      ├── Ingress
+      └── Core application services
+```
+
+Then perhaps VCF simply supplies appropriately isolated infrastructure:
+
+```text
+VCF Workload Infrastructure
+          │
+      Standard VMs
+          │
+        RKE2
+          │
+    Enterprise Core
+          │
+  ┌───────┼────────┐
+GitLab  Atlassian  etc.
+```
+
+I'm **not saying that's the answer yet**. GitLab, Satellite, AD, Elastic and some others have reasons they might live outside Kubernetes or have different availability/recovery requirements.
+
+But we shouldn't decide their placement because *"that's where infrastructure services traditionally go."*
+
+That's precisely the legacy thinking we're trying not to carry forward.
+
+### And I think we're finally seeing the layers
+
+Without formalizing the DAG yet, I'd keep this mental picture:
+
+```text
+             ┌─────────────────────────┐
+             │    MISSION / OBJECTIVE  │
+             └────────────▲────────────┘
+                          │
+             ┌────────────┴────────────┐
+             │ APPLICATION CAPABILITY  │
+             └────────────▲────────────┘
+                          │
+             ┌────────────┴────────────┐
+             │    ENTERPRISE CORE      │
+             │ security / identity /   │
+             │ entitlement / services │
+             └────────────▲────────────┘
+                          │
+             ┌────────────┴────────────┐
+             │     RKE2 / RANCHER      │
+             └────────────▲────────────┘
+                          │
+             ═══════════════════════════
+                INFRASTRUCTURE CONTRACT
+             ═══════════════════════════
+                    ▲             ▲
+                    │             │
+                 VCF 9         Azure IaaS
+                    ▲             ▲
+                    │             │
+                 On-Prem        Cloud
+```
+
+That horizontal line is the thing I'd keep staring at.
+
+**What's the contract?**
+
+Once we understand that, a lot of other decisions become easier.
+
+And the unanswered questions you have right now are completely appropriate. We don't need to fill those blanks with assumptions. We're getting to the point where we know **which questions matter**, which is considerably more valuable than prematurely having answers.
+
+I'd keep `HYP-PLAT-001 Portable Core` open, but annotate it now with **"strong evidence / partially validated"** because you've personally demonstrated that the same RKE2 deployment works on-prem. Next week's discussion may tell us exactly where the enterprise believes that portability boundary sits.
+
+---
+
+Yes. **That gives us the bottom boundary we've been missing.** I would treat this as a foundational scope decision for the new DAG.
+
+The DAG no longer asks, “How do we reconstruct the entire physical enterprise?” It asks:
+
+> **Given functioning physical infrastructure and connectivity, how do we reconstruct the on-prem private-cloud stack through IaC until Mission/Objective capability is restored?**
+
+Your Day-0 boundary becomes:
+
+```text
+══════════════════════════════════════════════════════
+             OUT OF SCOPE / ASSUMED OPERATIONAL
+
+ Dell chassis / blades / physical compute
+ Storage infrastructure
+ Physical switching / routing
+ WAN / ISP circuits
+ iDRAC / OOB management
+ Required VLANs / physical network fabric
+ Power / facilities
+══════════════════════════════════════════════════════
+                   DAY-0 BOUNDARY
+══════════════════════════════════════════════════════
+                         │
+                         ▼
+                  VCF 9 BOOTSTRAP
+                         │
+                         ▼
+                  VCF FOUNDATION
+                         │
+                         ▼
+                 VIRTUAL INFRASTRUCTURE
+                         │
+                         ▼
+                  PLATFORM / CORE
+                         │
+                         ▼
+                SECURITY / IDENTITY
+                         │
+                         ▼
+                    ENTITLEMENT
+                         │
+                         ▼
+                     SERVICES
+                         │
+                         ▼
+               MISSION / OBJECTIVE
+```
+
+And I'd make another important distinction: **“VCF 9 Bootstrap” doesn't necessarily mean VCF is literally the first thing we build.**
+
+Our DAG needs to discover what must exist immediately above your Day-0 boundary before VCF can be installed.
+
+For example, we may discover:
+
+```text
+DAY-0 ASSUMED INFRASTRUCTURE
+          │
+          ├──► Bootstrap DNS?
+          ├──► NTP?
+          ├──► Certificates / PKI?
+          ├──► Installation media?
+          ├──► IaC execution host?
+          ├──► Secrets / credentials?
+          │
+          ▼
+      VCF 9 Deployment
+```
+
+Those are now legitimate DAG questions because they're **above your boundary**. We don't chase DNS down to “what switch is the DNS server connected to?” That's below the line.
+
+### The cyberattack scenario gives us a very useful test
+
+For every component above that line, we can now ask:
+
+> **Assume this component is gone. What do I need, starting only with the Day-0 foundation, to reconstruct it through IaC?**
+
+That gives us a consistent test for every DAG node.
+
+For example:
+
+```text
+RKE2
+ │
+ ├─ requires VMs
+ ├─ requires networking
+ ├─ requires DNS
+ ├─ requires NTP
+ ├─ requires OS image
+ ├─ requires installation artifacts
+ └─ requires IaC execution
+```
+
+Then each dependency gets tested the same way.
+
+Eventually we'll find the true reconstruction order.
+
+### I'd also freeze Azure out of this DAG
+
+Not because Azure doesn't matter, but because you just established a clean scope:
+
+```text
+                  ENTERPRISE ARCHITECTURE
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+          ON-PREM                     AZURE
+              │                         │
+        OUR NEW DAG                Existing process
+              │                   / TBD understanding
+              ▼
+          VCF 9
+              │
+              ▼
+        Common Core
+              │
+              ▼
+      Mission / Objective
+```
+
+Later we can compare the two branches and identify where they converge.
+
+For now, **don't contaminate the on-prem dependency analysis with Azure implementation details we don't know.**
+
+### This also gives us a much better definition of “Day 0”
+
+I'd capture your decision approximately as:
+
+> **FND-SCOPE-001 — Day-0 Infrastructure Boundary**
+>
+> For greenfield and cyber-recovery dependency analysis, physical compute, storage, network fabric, WAN connectivity, out-of-band management, required physical VLANs, facilities, and other underlying infrastructure are assumed operational. The reconstruction DAG begins with the minimum bootstrap capabilities required to deploy VCF 9 and proceeds through private-cloud infrastructure, platform/core services, security, identity, entitlement, applications/services, and ultimately restoration of mission capability.
+>
+> Azure reconstruction is outside the initial DAG scope and will be analyzed separately once the sister organization's recovery/IaC architecture is understood.
+
+And I'd add one more status:
+
+**Confirmed Decision.**
+
+That's not a hypothesis anymore; **you've established our analysis boundary.**
+
+Now we're in a much better position. As you give me decisions and requirements from here forward, I can test each one against a very simple question:
+
+```text
+        BELOW DAY-0?
+             │
+       YES ──┴── NO
+        │         │
+     Assume      Put it
+   operational   in DAG
+```
+
+That should prevent exactly the problem you identified: disappearing down into Dell chassis, SANs, switch configurations, circuits, iDRAC networks, and other layers when the actual problem you're trying to solve is **how to reconstruct the private cloud and everything required to restore the mission once that underlying foundation is available.**
+
+---
+Yes — **conceptually**, with one important correction: the old `Domain → Segment1` boundary does not necessarily disappear as a **network security control**. What disappears is the assumption that **being on one side of that boundary is itself the primary basis for trust**.
+
+Your new model is much closer to:
+
+```text
+OLD MODEL
+
+        DOMAIN                    SEGMENT1
+   "Highly Trusted"             "Controlled"
+         │                           │
+         │   tightly restricted     │
+         ├──────── firewall ─────────┤
+         │                           │
+        AD/RSA                   Keycloak
+```
+
+The architecture largely said:
+
+> “Segment1 is less trusted, therefore only certain network paths can cross into Domain.”
+
+The new model can say:
+
+```text
+                 IDENTITY-BASED ACCESS REQUEST
+
+WHO?
+Keycloak / authorized identity
+        │
+        ▼
+WHAT?
+Authentication / MFA
+        │
+        ├── LDAP/LDAPS
+        ├── Kerberos (where required)
+        ├── RSA authentication
+        └── OIDC/SAML/etc.
+        │
+        ▼
+WHERE?
+Specific authorized service
+        │
+        ├── tc.org AD
+        └── RSA Authentication Manager
+        │
+        ▼
+POLICY
+Allow only the explicitly required flow
+        │
+        ▼
+RESOURCE
+```
+
+So your shorthand is actually very good:
+
+> **WHO:** Keycloak
+> **WHAT:** LDAP/MFA authentication protocols
+> **WHERE:** AD and RSA
+> **WHY:** Authenticate/authorize a defined population for a defined service
+
+And I would add **HOW**:
+
+> **HOW:** explicitly permitted network flows enforced by firewall/NSX policy.
+
+That last piece is important when explaining this to Security.
+
+### We're not proposing removing segmentation
+
+We're changing **what the segmentation represents**.
+
+Today you have something approximately like:
+
+```text
+DOMAIN | FIREWALL | SEGMENT1
+```
+
+and membership/location in those networks carries a lot of implicit trust.
+
+The greenfield model could become:
+
+```text
+                VCF PRIVATE CLOUD
+                       │
+                Security Policy
+                       │
+       ┌───────────────┼────────────────┐
+       │               │                │
+    Identity        Service          Workload
+    Services        Services          VPCs
+       │               │                │
+      AD             GitLab          Developer
+      RSA            Jira            Workloads
+                    Confluence
+```
+
+Then NSX/firewalls still enforce boundaries, but policies describe **required communication**, rather than merely reproducing the historical zones.
+
+For example:
+
+```text
+SOURCE
+Keycloak nodes
+
+DESTINATION
+tc.org Domain Controllers
+
+PURPOSE
+User authentication / lookup
+
+ALLOWED
+LDAPS 636
+
+DENIED
+Everything else
+```
+
+And separately:
+
+```text
+SOURCE
+Keycloak nodes
+
+DESTINATION
+RSA Authentication Manager
+
+PURPOSE
+Privileged MFA
+
+ALLOWED
+Only RSA-required protocol(s)
+
+DENIED
+Everything else
+```
+
+That's actually **stronger segmentation in one sense**, because we're defining the permitted relationship between specific services instead of saying “Segment1 can communicate with Domain under these broad rules.”
+
+### AD also stops being synonymous with "Domain"
+
+This is another mental shift worth making.
+
+Historically:
+
+```text
+DOMAIN NETWORK
+     │
+     ├── AD
+     ├── RSA
+     ├── Admin systems
+     ├── Users
+     └── Other trusted systems
+```
+
+So **AD security and Domain network security became mentally coupled**.
+
+In the greenfield design, think of AD as a **protected identity service**:
+
+```text
+                  tc.org AD
+                     ▲
+                     │
+              Identity Service
+                     │
+          ┌──────────┼───────────┐
+          │          │           │
+      Keycloak     Admin       Other
+          │       Workflows    approved
+          │                     consumers
+          ▼
+    Approved protocol
+    Approved source
+    Approved identity
+    Approved purpose
+```
+
+AD should still be extremely protected. It just doesn't require recreating an entire legacy **Domain network** merely because AD exists.
+
+### And that may finally solve the RODC question differently
+
+Our old architecture needed:
+
+```text
+Domain AD
+   │
+   ▼
+Segment1 RODC
+   │
+   ▼
+Segment1 services
+```
+
+because the security boundary largely prohibited direct communication.
+
+In the new architecture, we can ask the more fundamental question:
+
+> **Why does an RODC need to exist?**
+
+If the answer is merely:
+
+> “Because Segment1 wasn't allowed to communicate directly with Domain AD,”
+
+then once the governing policy permits **explicit identity-service flows**, the architectural reason for that RODC may disappear.
+
+Maybe we eventually get:
+
+```text
+Keycloak ─── LDAPS ───► tc.org AD
+    │
+    └──── RSA protocol ───► RSA
+```
+
+with NSX/firewall policy allowing **only those exact relationships**.
+
+The legacy `dev.local` RODC remains temporarily because **legacy systems require it**, not because it is part of the target architecture.
+
+That's a huge distinction.
+
+### The phrase I'd use with your Security Manager
+
+I wouldn't tell them:
+
+> “We're getting rid of the Domain/Segment1 security boundary.”
+
+That will understandably sound like **removing a security control**.
+
+I'd say:
+
+> **“We're evaluating moving from security based primarily on network-zone membership to explicit service-to-service access policy. The network remains segmented, but access is defined by who is communicating, what service and protocol is required, where it is allowed to communicate, and why that access is required.”**
+
+Then show them something this simple:
+
+```text
+OLD
+
+Where am I?
+    ↓
+Domain / Segment1 / Dev
+    ↓
+What am I allowed to reach?
+
+
+NEW
+
+Who am I?
+    +
+What am I accessing?
+    +
+Why?
+    +
+Which protocol?
+    +
+Which destination?
+    ↓
+Explicit Policy
+    ↓
+ALLOW / DENY
+```
+
+That also maps much more naturally to the controlled-connected/cloud model you've been describing.
+
+And **this belongs in the new DAG as a Decision Required, not yet a Confirmed Decision**. The governing security policy ultimately determines whether the old Domain/Segment1 routing boundary can actually be retired. But architecturally, we now have a credible replacement model to put in front of Security rather than merely asking them to remove an old boundary.
+
+---
+
+Yes. That is a **much better Day-0 boundary**, and it removes a lot of unnecessary bootstrap complexity from this particular effort.
+
+We are **not designing full bare-metal disaster recovery**. We're designing **automated reconstruction of the private-cloud/platform stack from a surviving virtualization foothold**.
+
+I'd define the boundary this way:
+
+> **Day-0 Recovery Boundary:** Physical infrastructure, network, storage, and a minimal functioning ESXi capability are assumed operational. The recovery process begins by introducing a trusted bootstrap artifact into that surviving ESXi environment. That artifact establishes the IaC execution capability required to reconstruct VCF 9 and all higher-level platform dependencies.
+
+That produces a much clearer dependency chain:
+
+```text
+════════════════════════════════════════════════════════
+        ASSUMED OPERATIONAL / BELOW SCOPE
+
+  Dell chassis / blades
+  Physical network / routing / VLANs
+  Storage
+  WAN / required connectivity
+  iDRAC / OOB
+  ESXi installed and functional
+════════════════════════════════════════════════════════
+                  DAY-0 BOUNDARY
+════════════════════════════════════════════════════════
+                         │
+                         ▼
+                TRUSTED BOOTSTRAP ARTIFACT
+                  USB / ISO / OVA / etc.
+                         │
+                         ▼
+                 BOOTSTRAP ENVIRONMENT
+                    VM / Container
+                         │
+                ┌────────┼────────┐
+                │        │        │
+             Ansible  Terraform  Other IaC
+                │        │
+                └────────┼────────┘
+                         ▼
+                    VCF 9 BUILD
+                         │
+                         ▼
+              VCF Infrastructure
+                         │
+                         ▼
+              Standard VM Resources
+                         │
+             "Infrastructure Contract"
+                         │
+                         ▼
+                       RKE2
+                         │
+                         ▼
+                 Enterprise Core
+                         │
+                         ▼
+              Security / Identity /
+             Entitlement / Services
+                         │
+                         ▼
+                 Mission Objective
+```
+
+And **now “Infrastructure Contract” becomes useful again**, because we've found where it sits.
+
+It's not a thing we necessarily install. It's the **handoff point** between the infrastructure automation and the portable RKE2/core automation:
+
+```text
+       VCF-SPECIFIC IaC
+              │
+              ▼
+     ┌───────────────────┐
+     │ Required VM(s)    │
+     │ CPU / RAM         │
+     │ Storage           │
+     │ Networking        │
+     │ DNS               │
+     │ NTP               │
+     │ OS                │
+     │ Connectivity      │
+     └─────────┬─────────┘
+               │
+        INFRASTRUCTURE
+           CONTRACT
+               │
+               ▼
+        COMMON CORE IaC
+               │
+              RKE2
+               │
+        Enterprise Core
+```
+
+That boundary should eventually let us say:
+
+**Below it:** implementation is VCF-specific.
+
+**Above it:** implementation should be portable across VCF/Azure to the extent the governing architecture intends.
+
+---
+
+### There's an especially interesting new component: the bootstrap environment
+
+I think this deserves its own first-class node in the DAG.
+
+Call it something provisional like:
+
+**`FND-BOOT-001 — IaC Bootstrap Environment`**
+
+Its purpose is simple:
+
+> Provide the minimum trusted execution environment required to reconstruct VCF and reach the point where normal enterprise IaC capabilities become available.
+
+This isn't necessarily your normal AAP server, GitLab, RKE2 cluster, or production Terraform environment.
+
+In fact, **it probably shouldn't depend on any of them.**
+
+Think:
+
+```text
+USB / ISO / OVA
+       │
+       ▼
+ Bootstrap VM
+       │
+       ├── Terraform
+       ├── Ansible
+       ├── VCF tooling
+       ├── Required providers/modules
+       ├── Initial configuration
+       ├── Certificates?
+       ├── Secrets bootstrap?
+       └── IaC repository snapshot?
+              │
+              ▼
+          BUILD VCF
+```
+
+Especially because you're air-gapped, this becomes important.
+
+A cyberattack recovery scenario can't assume:
+
+> `git clone https://somewhere...`
+
+It may need to assume:
+
+```text
+Trusted Offline Recovery Package
+             │
+             ├── IaC code
+             ├── Terraform providers
+             ├── Ansible collections
+             ├── container images
+             ├── VCF deployment artifacts
+             ├── OS images/templates
+             ├── checksums/signatures
+             └── bootstrap instructions
+                       │
+                       ▼
+                 Bootstrap VM
+```
+
+That package could potentially be versioned, cryptographically validated, periodically tested and stored offline.
+
+Now we're getting into something much more concrete than generic DR.
+
+### And this gives the DAG a very precise starting question
+
+We don't start with:
+
+> **"What does VCF depend upon?"**
+
+We start with:
+
+> **"I have functioning ESXi and an approved offline recovery artifact. What is the first thing I need to do to reconstruct the target private cloud?"**
+
+Then:
+
+> What does that require?
+
+Then:
+
+> What can it build next?
+
+Eventually:
+
+```text
+Surviving ESXi
+      ↓
+Bootstrap IaC
+      ↓
+VCF 9
+      ↓
+Infrastructure Contract
+      ↓
+RKE2
+      ↓
+Core
+      ↓
+Identity / Security / Entitlement
+      ↓
+Services
+      ↓
+Mission
+```
+
+**That is now the backbone of our new DAG.**
+
+Everything else we're discussing—`tc.org`, AD placement, Keycloak, RSA, DNS, PKI, HAProxy/load balancing, Satellite, GitLab, Rancher, Elastic, etc.—gets attached to that backbone according to **what must exist before it can be reconstructed and what subsequently depends upon it.**
+
+And I'd explicitly keep **“complete bare-metal recovery” outside the scope**. It could eventually have its own DAG feeding into this one:
+
+```text
+FULL DR DAG
+     │
+     ▼
+Hardware → Network → Storage → ESXi
+                              │
+                              ▼
+                    ═ DAY-0 HANDOFF ═
+                              │
+                              ▼
+                     OUR CURRENT DAG
+```
+
+That keeps this effort bounded while still leaving a clean interface for somebody to solve the lower-level recovery problem later.
+
+---
+
+Exactly. I'll use **your orientation from here forward**:
+
+**Bottom = physical/on-prem foundation → Up = increasingly abstract capabilities → Top = mission/objective.**
+
+So when you say **“move the boundary down,”** I'll interpret that as expanding the scope closer toward bare metal. When you say **“move up the stack,”** we're moving toward VCF → RKE2 → identity/security → services → mission.
+
+For our current effort, the house analogy is actually very clean:
+
+```text
+                         ┌─────────────────────┐
+                         │   MISSION / GOAL    │  ← ROOF
+                         └──────────▲──────────┘
+                                    │
+                         Applications / Services
+                                    ▲
+                                    │
+                    Entitlement / Authorization
+                                    ▲
+                                    │
+                     Identity / Security / Policy
+                                    ▲
+                                    │
+                       Enterprise Core Services
+                                    ▲
+                                    │
+                          RKE2 / Rancher
+                                    ▲
+                                    │
+                    Infrastructure Requirements
+                         ("contract" boundary)
+                                    ▲
+                                    │
+                               VCF 9
+                                    ▲
+                                    │
+                     IaC Bootstrap Environment
+                    Ansible / Terraform / tooling
+                                    ▲
+                                    │
+════════════════════ CURRENT SCOPE BOUNDARY ═══════════════════
+                                    ▲
+                                    │
+                       FUNCTIONING ESXi HOST(S)
+                                    │
+                         ← HOUSE FOOTERS →
+═══════════════════════════════════════════════════════════════
+                     BELOW CURRENT EFFORT
+
+                  ESXi installation/recovery
+                  Dell chassis / blades
+                  Storage
+                  Physical networking
+                  Routing / circuits
+                  OOB / iDRAC
+                  Facilities / power
+```
+
+And later, if we want **true full-stack disaster recovery**, we simply **move the bottom boundary downward**:
+
+```text
+Current:
+
+             Mission
+                ▲
+               ...
+                ▲
+              VCF
+                ▲
+          IaC Bootstrap
+                ▲
+        ═══ BOUNDARY ═══
+                ▲
+              ESXi
+
+
+Future:
+
+             Mission
+                ▲
+               ...
+                ▲
+              VCF
+                ▲
+          IaC Bootstrap
+                ▲
+              ESXi
+                ▲
+          Storage / Network
+                ▲
+          Dell Hardware
+                ▲
+        ═══ BOUNDARY ═══
+                ▲
+        Facility / new DC
+```
+
+That also gives us a useful rule for the DAG: **arrows point upward when the lower component supports/is required by the component above it.**
+
+So:
+
+```text
+ESXi
+  ↑
+IaC Bootstrap
+  ↑
+VCF 9
+  ↑
+VM Infrastructure
+  ↑
+RKE2
+  ↑
+Core
+  ↑
+Identity / Security / Entitlement
+  ↑
+Services
+  ↑
+MISSION
+```
+
+We can still talk about **upstream/downstream dependencies** when useful, but for diagrams I'll favor **foundation/supports-above terminology**, because it matches the governing body's house/brick concept and, more importantly, the way you're mentally modeling it.
+
+There's also a nice consequence: the **bottom boundary becomes movable without redesigning the DAG above it**. Today's footer is "functioning ESXi." Later we can attach an ESXi-recovery layer underneath. Later still, a greenfield-datacenter layer can go underneath that.
+
+The roof doesn't change. We're simply adding more foundation underneath the existing house.
+
+I'll carry this orientation into the new VCF/IaC DAG when we get to the point of actually constructing it.
+
+---
+
+Okay, with the baseline boundary set, now we need to determine what absolute bare minimum services and resources are required to install VCF 9 on an esxi host so that we can determine what needs to be in this IaC VM; containers (ansible|terraform|registry|DNS)?, IP scheme in json/csv/something else format, scripts that need to be created, etc..
+
+---
+
+Yes. **Now we are at the right place to start engineering the bottom of the DAG.** And after checking the current VCF 9 deployment model, there is one correction to our mental picture that helps considerably:
+
+For a **new VCF 9 deployment**, Broadcom's VCF Installer appliance is the bootstrap mechanism. It replaced Cloud Builder. It can consume a reusable **JSON deployment specification**, validate it, and deploy the initial management cluster and VCF components. A new VCF 9 management cluster requires at least **four hosts**; storage can be vSAN, NFS, or VMFS on FC depending on the supported design. ([VMware Blogs][1])
+
+So I would **not** start by stuffing Ansible + Terraform + DNS + registry + everything else into one giant recovery VM. We should determine what is truly required to get **VCF operational**, and only then determine what the bootstrap appliance needs.
+
+## Start with this minimum chain
+
+```text
+                         ↑
+                    RKE2 / CORE
+                         ↑
+                Infrastructure Contract
+                         ↑
+                 VCF 9 OPERATIONAL
+                         ↑
+                 VCF 9 DEPLOYMENT
+                         ↑
+                 VCF INSTALLER
+                         ↑
+              BOOTSTRAP SERVICES
+                         ↑
+                 IaC BOOTSTRAP VM
+                         ↑
+══════════════════ CURRENT BOUNDARY ══════════════════
+                         ↑
+             FUNCTIONING ESXi HOST(S)
+             Storage / Network / VLANs
+                 assumed operational
+```
+
+VCF Installer itself is relatively lightweight, but importantly **it does not contain the VCF software binaries**. In an air-gapped environment Broadcom supports using a private offline depot from which the Installer obtains the binaries. ([VMware Blogs][1])
+
+That immediately gives us our first hard dependency.
+
+### What I think the bootstrap environment actually needs
+
+I'd divide it into **five things**, rather than immediately deciding they're all containers.
+
+| Bootstrap capability   | Why we need it                                      | Likely implementation                 |
+| ---------------------- | --------------------------------------------------- | ------------------------------------- |
+| IaC execution          | Automate the bootstrap                              | Bootstrap Linux VM                    |
+| VCF Installer          | Actually deploy VCF 9                               | VMware appliance                      |
+| Offline software depot | VCF Installer needs binaries                        | HTTP/HTTPS repository                 |
+| DNS                    | VCF components require name resolution              | Temporary/authoritative bootstrap DNS |
+| Configuration source   | IPs, FQDNs, VLANs, credentials references, topology | Git/YAML/JSON                         |
+
+Then we investigate whether NTP, CA/certificates, secrets, DHCP, registry, etc. are hard **VCF-install dependencies** or dependencies for subsequent layers.
+
+I would **not assume a container registry is required yet.**
+
+That may belong higher:
+
+```text
+ESXi
+ ↑
+Bootstrap VM
+ ↑
+DNS / NTP / Offline VCF Depot
+ ↑
+VCF Installer
+ ↑
+VCF
+ ↑
+──────────────────────────────
+Infrastructure Contract
+ ↑
+RKE2
+ ↑
+Container Registry
+ ↑
+Core
+```
+
+Or the registry may turn out to be needed to construct RKE2 and therefore needs to move below it. **The DAG should tell us.**
+
+---
+
+## The configuration data is especially interesting
+
+VCF 9 no longer requires the old Deployment Parameters Workbook for the actual installation. Broadcom still provides a **Planning and Preparation Workbook** for design, but the Installer can generate/reuse a JSON spec that can be uploaded, reviewed and validated. ([VMware Blogs][1])
+
+That's excellent for your IaC objective.
+
+Instead of making Excel the authoritative configuration, I would eventually expect something conceptually like:
+
+```text
+bootstrap/
+├── README.md
+│
+├── inventory/
+│   ├── site.yaml
+│   ├── hosts.yaml
+│   ├── networks.yaml
+│   ├── dns.yaml
+│   └── ntp.yaml
+│
+├── vcf/
+│   ├── vcf-deployment.json
+│   └── variables.yaml
+│
+├── terraform/
+│   └── ...
+│
+├── ansible/
+│   └── ...
+│
+├── scripts/
+│   ├── validate-dns.sh
+│   ├── validate-network.sh
+│   ├── validate-esxi.sh
+│   └── validate-vcf-prereqs.sh
+│
+└── artifacts/
+    └── manifest.yaml
+```
+
+I would **not duplicate the same IP address in CSV + YAML + JSON + Terraform variables**.
+
+We want **one source of truth**.
+
+For example:
+
+```yaml
+site:
+  name: edc01
+  domain: tc.org
+
+dns:
+  servers:
+    - 10.x.x.x
+    - 10.x.x.x
+
+ntp:
+  servers:
+    - ntp01.tc.org
+    - ntp02.tc.org
+
+networks:
+
+  management:
+    vlan: 100
+    cidr: 10.x.100.0/24
+    gateway: 10.x.100.1
+
+  vmotion:
+    vlan: 110
+    cidr: 10.x.110.0/24
+
+  vsan:
+    vlan: 120
+    cidr: 10.x.120.0/24
+
+hosts:
+
+  esx01:
+    fqdn: esx01.tc.org
+    management_ip: 10.x.100.11
+
+  esx02:
+    fqdn: esx02.tc.org
+    management_ip: 10.x.100.12
+
+  esx03:
+    fqdn: esx03.tc.org
+    management_ip: 10.x.100.13
+
+  esx04:
+    fqdn: esx04.tc.org
+    management_ip: 10.x.100.14
+```
+
+Then automation **generates** the VCF Installer JSON from that source.
+
+That's much closer to true IaC than maintaining a spreadsheet manually.
+
+---
+
+# The bootstrap VM may be surprisingly small
+
+I could see the first iteration becoming:
+
+```text
+             BOOTSTRAP VM
+                 RHEL
+                  │
+      ┌───────────┼────────────┐
+      │           │            │
+   Ansible    Terraform      Git
+      │
+      │
+      ├── validation
+      ├── DNS bootstrap
+      ├── artifact/depot setup
+      ├── deploy VCF Installer
+      └── initiate VCF build
+                  │
+                  ▼
+          Local HTTP(S) Depot
+                  │
+                  ▼
+            VCF Installer
+                  │
+                  ▼
+               VCF 9
+```
+
+The bootstrap VM itself could potentially host temporary services as containers:
+
+```text
+Bootstrap VM
+│
+├── Ansible
+├── Terraform
+├── Git
+│
+└── Podman
+     │
+     ├── bootstrap DNS
+     ├── HTTP/HTTPS artifact repository
+     └── possibly other bootstrap services
+```
+
+But I'd make those **implementation decisions later**.
+
+For example, if your existing physical/enterprise DNS survives the attack and can contain all the necessary VCF records, there's no reason to build a temporary DNS container.
+
+Conversely, if our recovery premise says:
+
+> "AD/DNS is gone because everything above ESXi was destroyed"
+
+then **bootstrap DNS becomes mandatory**.
+
+That's exactly the dependency-analysis question we need to answer.
+
+---
+
+# I think our first mini-DAG should therefore be VCF only
+
+Before worrying about RKE2, Keycloak, AD, RSA, GitLab or anything else, let's solve:
+
+> **Starting with four or more functioning ESXi hosts, network and storage, what is the absolute minimum self-contained recovery package required to produce a functioning VCF 9 management domain without Internet access?**
+
+Broadcom confirms the VCF Installer can deploy the initial vCenter, NSX, VCF Operations and VCF Automation stack; the simple model is at least seven appliances, while production HA expands several components to three-node configurations. ([VMware Blogs][1])
+
+So our first DAG slice becomes:
+
+```text
+                         VCF 9
+                           ↑
+                    VCF Installer
+                           ↑
+       ┌───────────────────┼────────────────────┐
+       │                   │                    │
+  Deployment JSON     VCF Binaries        DNS / NTP
+       ↑                   ↑                    ↑
+       │                   │                    │
+       └───────────────────┼────────────────────┘
+                           ↑
+                    Bootstrap VM
+                           ↑
+                  Recovery Artifact
+                    USB / ISO / OVA
+                           ↑
+═══════════════════ DAY-0 BOUNDARY ═══════════════════
+                           ↑
+                 FUNCTIONING ESXi
+```
+
+And **this is where I'd stop for the moment**, because now we can research each box against Broadcom's actual VCF 9 prerequisites rather than speculate.
+
+The next exercise should be very concrete: build a **VCF 9 Day-0 prerequisite matrix** with columns like `Requirement | Mandatory? | Needed By | Survives Day-0? | Bootstrap Implementation | Configuration Source | IaC Method | Recovery Artifact | DAG ID`.
+
+Once we fill that matrix from the VCF 9 documentation, we'll know exactly what belongs on that bootstrap VM—and, just as importantly, **what does not**.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+
+---
+
+Exactly. Your instinct to build a self-contained automation appliance was reasonable; **VCF 9 has moved a significant portion of the actual VCF deployment orchestration into the VCF Installer**. The Installer provides the deployment workflow, pre-checks, reusable JSON configuration, and deployment of the VCF stack. It does **not** carry the VCF binaries itself, so our air-gapped software source remains an external prerequisite. ([VMware Blogs][1])
+
+So our question is no longer:
+
+> “What automation do we need to write to install VCF?”
+
+It is:
+
+> **“What must exist below the VCF Installer so that the Installer can successfully produce VCF 9 from our surviving ESXi foundation?”**
+
+## VCF 9 Day-0 prerequisite matrix — starting version
+
+I'd start the matrix like this. Some entries are deliberately **TBD** because we should verify them rather than promote assumptions into architecture.
+
+| Requirement                  | Status                                                 | Why Installer needs it                                          | Day-0 implementation                   | Configuration source      |
+| ---------------------------- | ------------------------------------------------------ | --------------------------------------------------------------- | -------------------------------------- | ------------------------- |
+| Functional ESXi hosts        | **Required / boundary**                                | Target compute                                                  | Assumed surviving                      | Inventory                 |
+| Minimum management hosts     | **Required**                                           | New VCF management cluster                                      | ≥4 compatible hosts                    | Inventory                 |
+| Supported storage            | **Required**                                           | Management cluster storage                                      | Existing vSAN/NFS/FC                   | Inventory                 |
+| Physical/VLAN networking     | **Required / boundary**                                | Underlying connectivity                                         | Assumed surviving                      | Network definition        |
+| Management IP addressing     | **Required**                                           | ESXi + appliances                                               | Existing network                       | Source-of-truth file      |
+| DNS                          | **Required — implementation TBD**                      | FQDN/name resolution                                            | Bootstrap DNS or surviving DNS         | DNS definitions           |
+| NTP/time                     | **Likely required — verify exact rules**               | Consistent infrastructure time                                  | Bootstrap/existing NTP                 | NTP definitions           |
+| VCF Installer appliance      | **Required**                                           | VCF deployment engine                                           | OVA available offline                  | Recovery package          |
+| VCF 9 software binaries      | **Required**                                           | Installer does not contain them                                 | Private offline depot                  | Artifact manifest         |
+| VCF deployment specification | **Required configuration**                             | Describes desired deployment                                    | Generated/reusable JSON                | Source-controlled config  |
+| Installer/depot connectivity | **Required**                                           | Installer must retrieve binaries                                | Existing network                       | Network policy            |
+| Credentials/secrets          | **Required**                                           | ESXi/appliance/depot access                                     | TBD secure bootstrap mechanism         | **Never plain Git**       |
+| Certificates/CA              | **TBD**                                                | Depends on bootstrap/depot/design requirements                  | Determine exact minimum                | PKI/bootstrap             |
+| IaC bootstrap VM             | **Our requirement**                                    | Reproducible recovery orchestration                             | VM on surviving ESXi                   | Offline recovery artifact |
+| Ansible                      | **TBD**                                                | Our orchestration, not necessarily VCF requirement              | Possibly bootstrap VM                  | Git/recovery artifact     |
+| Terraform                    | **TBD**                                                | Same distinction                                                | Possibly bootstrap VM                  | Git/recovery artifact     |
+| Container runtime            | **TBD**                                                | Only if our bootstrap services require it                       | Podman/etc.                            | Bootstrap build           |
+| Container registry           | **Probably not VCF prerequisite**                      | More likely RKE2/core dependency                                | Higher in DAG unless proven otherwise  | TBD                       |
+| Git server                   | **Probably not VCF prerequisite**                      | IaC source management                                           | Avoid bootstrap dependency if possible | Offline repo snapshot     |
+| AD/LDAP                      | **TBD, probably not initial VCF bootstrap dependency** | Enterprise identity comes later unless installation requires it | Higher DAG layer                       | TBD                       |
+| Keycloak                     | **Not presumed Day-0**                                 | Enterprise federation                                           | Higher DAG layer                       | Later                     |
+| RSA                          | **Not presumed Day-0**                                 | MFA                                                             | Higher DAG layer                       | Later                     |
+
+Broadcom confirms that a new VCF 9 instance requires at least four management-cluster hosts and supports vSAN, NFS, or VMFS on FC. It also confirms that the Installer can deploy the initial vCenter, NSX, VCF Operations, VCF Automation and related VCF components. ([VMware Blogs][1])
+
+For our disconnected environment, the software depot is especially important. VCF supports a private offline depot, essentially an internally hosted software repository. Broadcom's offline-depot architecture uses an internal web server to serve the required bundles rather than requiring the VCF environment to reach the Internet. ([VMware Blogs][2])
+
+### Separate three different things
+
+This distinction will prevent us from overengineering the bootstrap VM:
+
+```text
+                    VCF 9
+                      ↑
+               VCF INSTALLER
+                      ↑
+       ┌──────────────┼──────────────┐
+       │              │              │
+   Installer       Software       Deployment
+   prerequisites     depot           config
+       ↑              ↑              ↑
+       └──────────────┼──────────────┘
+                      ↑
+              OUR AUTOMATION
+                      ↑
+               Bootstrap VM
+                      ↑
+══════════════ DAY-0 BOUNDARY ══════════════
+                      ↑
+             FUNCTIONING ESXi
+```
+
+**VCF Installer prerequisites** are things VMware requires.
+
+**Bootstrap services** are things we have to supply because of our environment—air gap, DNS loss, artifact storage, credentials, etc.
+
+**Our automation** is what makes reconstruction repeatable without an engineer manually clicking through everything.
+
+Those shouldn't get mixed together.
+
+For example, Terraform might ultimately have **nothing to do with installing the first VCF instance**. If VCF Installer already owns that operation, writing Terraform to duplicate it could actually make recovery more complicated.
+
+Ansible might still be extremely useful for:
+
+```text
+ESXi survives
+      ↑
+deploy bootstrap VM
+      ↑
+configure bootstrap DNS/NTP if necessary
+      ↑
+bring offline depot online
+      ↑
+deploy VCF Installer OVA
+      ↑
+perform prerequisite validation
+      ↑
+provide/generated deployment JSON
+      ↑
+invoke Installer
+      ↑
+VCF 9
+```
+
+And then Terraform may become much more important **above VCF**, when we're creating the VM/network resources necessary to satisfy the RKE2 infrastructure requirements.
+
+### JSON versus our source of truth
+
+VCF Installer explicitly supports reusable JSON specifications and validation. ([VMware Blogs][1])
+
+I don't think that necessarily means **VCF JSON should become our master enterprise configuration**, though.
+
+I'd prefer something like:
+
+```text
+                recovery-config.yaml
+                        │
+           OUR source of truth
+                        │
+        ┌───────────────┼────────────────┐
+        ▼               ▼                ▼
+   DNS records     VCF Installer     Ansible vars
+                       JSON
+                        │
+                        ▼
+                   VCF Installer
+```
+
+For example, one record:
+
+```yaml
+hosts:
+  esx01:
+    fqdn: esx01.tc.org
+    management_ip: 10.10.10.11
+
+networks:
+  management:
+    vlan: 100
+    cidr: 10.10.10.0/24
+    gateway: 10.10.10.1
+
+  vmotion:
+    vlan: 110
+    cidr: 10.10.11.0/24
+
+  storage:
+    vlan: 120
+    cidr: 10.10.12.0/24
+```
+
+could generate both the required DNS records and relevant pieces of the VCF Installer JSON.
+
+That prevents this nightmare:
+
+```text
+Excel says       10.10.10.11
+CSV says         10.10.10.12
+DNS says         10.10.10.13
+Terraform says   10.10.10.14
+VCF JSON says    10.10.10.15
+```
+
+## Most important: our first deliverable isn't the bootstrap VM
+
+It's the **completed prerequisite matrix**.
+
+We should resist choosing containers, Ansible, Terraform, BIND, Git, registry, etc. until we've gone requirement-by-requirement through the VCF 9 Installer prerequisites.
+
+Then the matrix will naturally tell us:
+
+```text
+VCF requires DNS
+        ↓
+Does DNS survive our Day-0 scenario?
+        ↓
+       NO
+        ↓
+Bootstrap environment must provide DNS
+        ↓
+How?
+        ↓
+BIND container / lightweight VM / other
+```
+
+versus:
+
+```text
+VCF requires X
+        ↓
+X is already below our Day-0 boundary
+and assumed functional
+        ↓
+Do nothing
+```
+
+That's dependency analysis rather than solution-first engineering—which is exactly what you've been trying to make the broader architecture effort do.
+
+**Next, I think we should build the actual matrix from Broadcom's VCF 9 planning/deployment requirements, not just this starter version.** We can go category by category—hosts/compute, storage, networking/IPs, DNS/NTP, software/depot, certificates, credentials, Installer appliance, and configuration data—and mark each **Required / Optional / Post-VCF / Unknown**, then derive the bootstrap VM from the completed matrix.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2024/07/24/vmware-cloud-foundation-offline-depot-introduction/?utm_source=chatgpt.com "VMware Cloud Foundation Offline Depot Introduction - VMware Cloud Foundation (VCF) Blog"
+
+---
+
+Yes. I pulled this back to Broadcom's current VCF 9 material and separated **what VCF itself requires** from **what our recovery architecture may choose to provide**. Broadcom explicitly recommends using a fresh VCF Planning and Preparation Workbook because its requirements and calculations change; the Installer then consumes those planned inputs. ([VMware Blogs][1])
+
+For this matrix, I'm assuming our exact scenario: **new VCF fleet / new management domain, air-gapped, starting above our boundary of functioning ESXi + physical networking/storage.** Not conversion/import of the existing vCenter environment.
+
+## VCF 9 Day-0 prerequisite matrix — v1
+
+| Area          | Requirement                   |                       Classification | Below our boundary? | What must exist at VCF Day-0                              | Bootstrap implication             |
+| ------------- | ----------------------------- | -----------------------------------: | :-----------------: | --------------------------------------------------------- | --------------------------------- |
+| Compute       | Supported ESXi hosts/hardware |                         **Required** |       **Yes**       | Compatible/certified ESXi hosts                           | Validate, don't build             |
+| Compute       | Management-domain host count  |                         **Required** |       **Yes**       | **Minimum 4 hosts** for new VCF instance                  | Inventory/validate                |
+| Compute       | CPU/RAM capacity              |                         **Required** |         Yes         | Enough capacity for selected appliance model              | Preflight validation              |
+| Storage       | Supported management storage  |                         **Required** |         Yes         | vSAN, NFS, or VMFS on FC                                  | Inventory/validate                |
+| Storage       | Shared/accessibility/capacity |                         **Required** |         Yes         | Required storage available to management hosts            | Preflight validation              |
+| Network       | Physical switching/routing    |                         **Required** |       **Yes**       | Operational                                               | None except validation            |
+| Network       | Management connectivity       |                         **Required** |        Mostly       | ESXi/Installer/appliances must communicate                | IP/config source                  |
+| Network       | VLAN/subnet design            |                         **Required** |      Partially      | Required management/vMotion/storage/NSX networks planned  | Config source                     |
+| Network       | MTU/connectivity              |                         **Required** |        Mostly       | Appropriate end-to-end connectivity for selected networks | Automated tests                   |
+| IP            | Static IP allocation          |                         **Required** |          No         | Appliance, host and network-pool addresses reserved       | **Source of truth**               |
+| DNS           | DNS service                   |                         **Required** |        **No**       | Reachable DNS                                             | Bootstrap or external DNS         |
+| DNS           | Forward records               |                         **Required** |          No         | Required VCF FQDN → IP mappings                           | Generate/provision                |
+| DNS           | Reverse records               |                         **Required** |          No         | Required IP → FQDN mappings                               | Generate/provision                |
+| NTP           | Time service                  |                         **Required** |          No         | Reachable/synchronized NTP                                | Bootstrap or existing             |
+| Software      | VCF Installer appliance       |                         **Required** |          No         | VCF Installer deployed and reachable                      | Recovery artifact                 |
+| Software      | VCF binaries                  |                         **Required** |          No         | Correct VCF software available                            | Offline depot/artifacts           |
+| Software      | Software-depot access         |                         **Required** |          No         | Installer can obtain required binaries                    | Bootstrap service                 |
+| Configuration | Deployment inputs             |                         **Required** |          No         | Hosts/networks/FQDNs/IPs/sizing/etc. defined              | Versioned configuration           |
+| Configuration | Installer JSON                |                  **Optional method** |          No         | Reusable JSON instead of manual wizard entry              | **Strongly desirable for us**     |
+| Credentials   | ESXi credentials              |                         **Required** |          No         | Installer can authenticate to hosts                       | Secure recovery secrets           |
+| Credentials   | Appliance/admin credentials   |                         **Required** |          No         | Required deployment passwords available                   | Secure recovery secrets           |
+| Compatibility | Supported BOM                 |                         **Required** |        Mostly       | Hardware/software/storage combinations supported          | Automated/manual gate             |
+| Ports         | Required ports/protocols      |                         **Required** |        Mostly       | Connectivity permitted between components                 | Preflight/firewall rules          |
+| Certificates  | Enterprise CA integration     |      **Post-VCF / design dependent** |          No         | Not something I would put in minimum bootstrap yet        | Higher DAG node                   |
+| AD            | Active Directory integration  |                         **Post-VCF** |          No         | Not required simply to establish VCF                      | Higher DAG node                   |
+| Keycloak      | Federated identity            |                         **Post-VCF** |          No         | Not required for initial VCF construction                 | Higher DAG                        |
+| RSA           | Enterprise MFA                |                         **Post-VCF** |          No         | Not required for initial construction                     | Higher DAG                        |
+| Git           | Git server                    |                       **Our choice** |          No         | VCF doesn't require a Git server to install               | Offline repo may suffice          |
+| Ansible       | Ansible                       |                       **Our choice** |          No         | VCF Installer does deployment                             | Useful bootstrap orchestration    |
+| Terraform     | Terraform                     |                       **Our choice** |          No         | Not a VCF Installer prerequisite                          | Probably more useful above VCF    |
+| Containers    | Container runtime             |                       **Our choice** |          No         | Not intrinsic VCF prerequisite                            | Only if bootstrap services use it |
+| Registry      | Container registry            | **Post-VCF unless proven otherwise** |          No         | Not required to produce initial VCF                       | Likely RKE2 dependency            |
+
+The key Broadcom facts underneath that table are solid: a new VCF instance requires at least four management-cluster hosts and supports vSAN, NFS, or VMFS on FC; VCF Installer replaces Cloud Builder; the Installer itself does **not** contain the VCF software binaries; an offline depot is supported; and the Installer supports a reusable JSON deployment specification that can be uploaded, validated, and edited. ([VMware Blogs][2])
+
+Broadcom also explicitly treats hardware, network, software, and environmental services as deployment prerequisites and recommends compatibility and ports/protocol validation before deployment. ([VMware Blogs][1])
+
+## DNS and NTP just became our first interesting bootstrap problem
+
+This is where our cyber-recovery scenario diverges from an ordinary VCF installation.
+
+VCF deployment planning requires the component FQDNs/IPs and management-domain network configuration; DNS and NTP are part of the management-domain configuration. Broadcom's planning process specifically has you populate management, deployment, and configuration inputs before handing those values to the Installer. ([VMware Blogs][1])
+
+The practical bring-up guidance is stronger: required component FQDNs need to resolve before deployment, with forward and reverse DNS, and time synchronization needs to be available. ([Journal of Intelligent Infrastructure][3])
+
+Our attack scenario says:
+
+```text
+Normal VCF deployment
+
+Enterprise DNS ───────┐
+Enterprise NTP ───────┼──► VCF Installer ──► VCF
+Enterprise Repo ──────┘
+
+
+OUR RECOVERY
+
+Enterprise DNS ── X
+Enterprise NTP ── X?
+Enterprise Repo ─ X
+AD              ─ X
+GitLab          ─ X
+RKE2            ─ X
+
+       functioning ESXi
+              ↑
+═══════════ BOUNDARY ═══════════
+              ↑
+              ?
+              ↑
+        VCF Installer
+              ↑
+             VCF
+```
+
+Therefore, **DNS definitely has to be solved below VCF in our DAG**.
+
+NTP also has to be solved below VCF, but it may be easier: if surviving physical routers/switches or some other infrastructure below our boundary can provide a trusted NTP source, we don't necessarily need to manufacture one inside the bootstrap VM.
+
+That's a design question rather than a VMware requirement.
+
+---
+
+# The offline depot is the other hard dependency
+
+The VCF Installer is intentionally lightweight. Broadcom says it doesn't ship with the VCF software binaries. It normally obtains them from the online depot, but supports a private offline depot. ([VMware Blogs][2])
+
+For us:
+
+```text
+Internet
+   X
+
+Broadcom online depot
+   X
+
+      OFFLINE RECOVERY MEDIA
+               │
+               ▼
+       VCF SOFTWARE DEPOT
+               │
+               ▼
+         VCF Installer
+               │
+               ▼
+              VCF
+```
+
+This means our recovery artifact needs considerably more than the VCF Installer OVA.
+
+It needs the **correct VCF BOM/software payload** or a mechanism for reconstructing the offline depot from trusted offline media.
+
+That's a first-class DAG dependency:
+
+**`FND-BOOT-DEPOT — VCF Offline Software Source`**
+
+---
+
+# The configuration source is probably our most important artifact
+
+Broadcom's Planning and Preparation Workbook remains useful because it calculates and organizes the required environment specification, but the VCF Installer itself supports reusable JSON. ([VMware Blogs][1])
+
+For normal deployment:
+
+```text
+Planning Workbook
+       ↓
+Engineer
+       ↓
+VCF Installer Wizard
+```
+
+For **our** reconstruction model, I'd aim toward:
+
+```text
+        recovery-config.yaml
+                │
+      ┌─────────┼──────────┐
+      │         │          │
+      ▼         ▼          ▼
+   DNS       Network      Host
+ records      config     inventory
+      │
+      └─────────┼──────────┘
+                ▼
+          GENERATION
+                │
+                ▼
+      vcf-deployment.json
+                │
+                ▼
+          VCF Installer
+```
+
+The Planning Workbook remains an important **design/validation artifact**, but I don't want Excel to become the machine-readable recovery source of truth.
+
+And I especially don't want:
+
+```text
+hosts.csv
+network.csv
+dns.csv
+workbook.xlsx
+terraform.tfvars
+ansible-vars.yml
+vcf.json
+```
+
+all independently defining the same infrastructure.
+
+That's configuration drift waiting to happen.
+
+---
+
+# What this does to our Bootstrap VM
+
+We can now make a much better first cut.
+
+I don't think we need a giant Swiss-army-knife appliance.
+
+Conceptually:
+
+```text
+                    BOOTSTRAP VM
+                         │
+        ┌────────────────┼─────────────────┐
+        │                │                 │
+        ▼                ▼                 ▼
+   Orchestration    Bootstrap DNS    Offline Depot
+    / validation       service          service
+        │                │                 │
+        └────────────────┼─────────────────┘
+                         │
+                         ▼
+                    VCF Installer
+                         │
+                         ▼
+                        VCF
+```
+
+And perhaps:
+
+```text
+BOOTSTRAP VM
+│
+├── Python
+├── Ansible
+├── OVF/OVA deployment tooling
+├── validation scripts
+│
+├── container: DNS
+│
+├── container: HTTP/HTTPS offline depot
+│
+├── configuration/
+│    └── recovery-config.yaml
+│
+└── generated/
+     ├── dns-records
+     ├── vcf-deployment.json
+     └── validation-report
+```
+
+**Terraform is no longer obviously required here.**
+
+It may be, but I wouldn't include it simply because we're calling this IaC.
+
+Ansible/Python/shell may be sufficient to deploy/configure the bootstrap services, deploy the VCF Installer OVA, generate configuration and invoke/drive the Installer.
+
+Terraform may become important immediately **above VCF**:
+
+```text
+                        MISSION
+                           ↑
+                          ...
+                           ↑
+                         RKE2
+                           ↑
+                Infrastructure Contract
+                           ↑
+                Terraform / Automation
+                           ↑
+                         VCF 9
+                           ↑
+                    VCF Installer
+                           ↑
+                Bootstrap automation
+                           ↑
+══════════════════ CURRENT BOUNDARY ═════════════════
+                           ↑
+                    Functional ESXi
+```
+
+That's exactly the kind of distinction the matrix was supposed to expose.
+
+## Five items I would now mark `DECISION REQUIRED`
+
+These aren't VMware questions anymore; they're **our architecture questions**:
+
+1. **Bootstrap DNS:** Do we deliberately make the recovery environment self-sufficient for DNS, or declare some DNS capability below our recovery boundary?
+
+2. **Bootstrap NTP:** Can surviving network infrastructure provide NTP, or must recovery media provide it?
+
+3. **Offline depot:** Is the depot itself contained in the recovery package, reconstructed onto the bootstrap VM, or maintained as an independent protected service?
+
+4. **Secrets:** How do we recover ESXi/root/bootstrap credentials after the assumed cyberattack without making the recovery package itself a catastrophic credential vault?
+
+5. **Source of truth:** What is the canonical machine-readable definition of the site? My current leaning is YAML → generated VCF JSON/DNS/Ansible inputs, but that's **our design decision**, not a Broadcom requirement.
+
+Those five decisions define most of the thing you originally imagined when you said **“IaC VM.”**
+
+So we've gone from:
+
+> *“Maybe I'll build a VM with Ansible, Terraform, registry, DNS, etc.”*
+
+to something much more defensible:
+
+> **“VCF Installer owns VCF deployment. Our bootstrap environment provides only the external capabilities that the VCF Installer cannot provide for itself and that are unavailable following our Day-0 cyber-loss scenario.”**
+
+That's a very good bottom brick for the architecture.
+
+[Broadcom/VMware — Planning a Successful VCF 9 Deployment](https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com)
+[Broadcom/VMware — VCF 9 Deployment Pathways and VCF Installer](https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com)
+
+The next pass should be even more concrete: **turn the matrix into the exact Day-0 inventory**—every FQDN/IP/network, DNS record, NTP value, ESXi datum, credential class, VCF binary/artifact and Installer input that must be present on recovery media before we walk into the datacenter. That will effectively become the specification for `FND-BOOT-001`.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[3]: https://drpranayjha.com/tools/vcf-workbook/?utm_source=chatgpt.com "VCF 9.1 Planning & Preparation Workbook — Interactive Walkthrough"
+
+---
+
+Yes. Those clarifications simplify the bottom of the architecture considerably, and I would change one part of my earlier recommendation: **don't make our own YAML the VCF source of truth if the VCF Installer's native JSON can serve that purpose.** VCF 9 is explicitly designed for repeatable deployments using downloadable/reusable JSON, and its API can validate the specification and initiate deployment. ([VMware Blogs][1])
+
+### Updated bottom of the DAG
+
+With your NTP clarification, I'd now model it as:
+
+```text
+                         VCF 9
+                           ↑
+                     VCF Installer
+                           ↑
+             ┌─────────────┼─────────────┐
+             │             │             │
+          DNS         Offline Depot   VCF JSON
+             ↑             ↑             ↑
+             └─────────────┼─────────────┘
+                           ↑
+                  IaC / Recovery VM
+                           ↑
+══════════════════ CURRENT BOUNDARY ══════════════════
+                           ↑
+                 Functional ESXi Hosts
+                 Functional Networking
+                 Functional Storage
+                 Stratum-1 NTP Appliance
+```
+
+So **NTP drops below our boundary**. We record its IP/FQDN in the VCF JSON/configuration, validate reachability, and don't reconstruct it.
+
+## Yes, I like DNS on the recovery VM
+
+Given *our particular recovery premise*, a tiny authoritative DNS service on the IaC/recovery VM makes a lot of sense.
+
+Remember what we're trying to accomplish: AD/DNS and higher services may be gone, but VCF needs name resolution during reconstruction. DNS therefore cannot depend upon VCF or AD.
+
+I'd favor:
+
+```text
+IaC Recovery VM
+│
+├── bootstrap/recovery automation
+├── VCF Installer deployment automation
+├── VCF configuration
+│
+├── DNS container
+│    └── starts automatically with VM
+│
+└── Offline VCF Depot
+     └── HTTP/HTTPS service
+```
+
+A containerized BIND instance is entirely reasonable. The important architectural requirement isn't "BIND" or "container"; it's:
+
+> **A minimal authoritative DNS capability exists independently of VCF and enterprise AD/DNS and can resolve every name required to construct VCF.**
+
+VCF is sensitive to DNS, and VCF Installer has explicit DNS-related configuration structures and validations. Broadcom also documents deployment failures when the Installer cannot obtain required DNS information. ([Broadcom Developer][2])
+
+I'd have that container **start automatically when the recovery VM boots** and generate its zone data from our recovery configuration rather than maintaining a second hand-edited copy.
+
+Eventually:
+
+```text
+              VCF deployment JSON
+                       │
+                 extraction/
+                  generation
+                       │
+             Bootstrap DNS zone
+                       │
+                       ▼
+                 DNS container
+```
+
+That keeps DNS from becoming another independent source of truth.
+
+---
+
+## Your lab-install question is the really important one
+
+I would **not** choose between:
+
+**A. manually install VCF and reverse-engineer it**
+
+or
+
+**B. attempt perfect automated IaC deployment on the first try.**
+
+I'd deliberately do both, sequentially.
+
+### Lab Build #1 — Learn VCF
+
+Use the VCF Installer interactively.
+
+Our objective isn't automation yet. It's understanding exactly what VCF asks us for.
+
+```text
+Known Lab Infrastructure
+          ↑
+VCF Installer UI
+          ↑
+Enter everything manually
+          ↑
+Validate
+          ↑
+Correct mistakes
+          ↑
+Deploy VCF
+          ↑
+WORKING VCF #1
+```
+
+During that installation we document:
+
+* every question the Installer asks;
+* every FQDN;
+* every IP;
+* every VLAN/network;
+* every credential class;
+* every DNS record;
+* every storage selection;
+* every appliance-sizing choice;
+* every software binary;
+* every validation/precheck failure;
+* every external dependency we discover.
+
+Most importantly, **download/save the resulting VCF Installer JSON**.
+
+Broadcom specifically designed VCF 9 to support this workflow: the Installer can generate a reusable JSON specification, and VCF Operations documentation describes the JSON as something that can be saved for future builds/reference. ([VMware Blogs][1])
+
+That becomes our first known-good specimen.
+
+### Lab Build #2 — Prove the JSON
+
+Destroy VCF #1.
+
+Don't modify the environment by hand to help ourselves.
+
+Start again at our boundary:
+
+```text
+Functional ESXi
+       ↑
+Recovery VM
+       ↑
+Bootstrap DNS
+       ↑
+Offline Depot
+       ↑
+VCF Installer
+       ↑
+Known-good JSON
+       ↑
+VCF #2
+```
+
+This time use **Deploy using JSON Spec**.
+
+Broadcom even documents reuse of a downloaded JSON spec when rebuilding/replacing the Installer. One significant warning for our design: the generated JSON can contain credentials in **plain text**, so we absolutely cannot casually treat that file as a normal Git artifact. 
+
+If Build #2 succeeds, we've proven something extremely important:
+
+> **The VCF JSON plus our external dependencies is sufficient to reproduce the VCF state.**
+
+Now we're doing reconstruction rather than documentation.
+
+### Lab Build #3 — Automate the bootstrap
+
+Now we automate everything **around** the Installer.
+
+```text
+          recovery/
+              │
+     ┌────────┼─────────┐
+     ▼        ▼         ▼
+   config   artifacts  secrets
+     │        │
+     └────┬───┘
+          ▼
+     bootstrap
+          │
+          ├── Validate ESXi
+          ├── Validate storage
+          ├── Validate network
+          ├── Validate Stratum-1 NTP
+          │
+          ├── Start DNS
+          ├── Load DNS records
+          │
+          ├── Start offline depot
+          ├── Validate binaries
+          │
+          ├── Deploy VCF Installer
+          ├── Validate VCF JSON
+          │
+          └── Start VCF deployment
+                    ↑
+                 VCF #3
+```
+
+VCF Installer exposes APIs for specification validation, resource calculation and starting the VCF installation, so this isn't necessarily UI automation or some brittle Selenium-style process. ([Broadcom Developer][3])
+
+**That's where Ansible may earn its place.**
+
+Not because Ansible installs VCF, but because Ansible could orchestrate the recovery environment that allows the **VCF Installer to install VCF**.
+
+---
+
+## Then Build #4 is the test that matters
+
+This one should simulate our actual premise.
+
+Treat everything above ESXi as gone.
+
+Take only our protected/offline recovery package and start from there.
+
+```text
+        OFFLINE RECOVERY PACKAGE
+                  │
+                  ▼
+          Recovery VM artifact
+                  +
+          Configuration/JSON
+                  +
+            VCF binaries
+                  +
+       secured bootstrap secrets
+                  │
+                  ▼
+══════════════ FUNCTIONING ESXi ═════════════
+                  │
+                  ↑
+             IaC VM boots
+                  ↑
+             DNS starts
+                  ↑
+          Depot becomes available
+                  ↑
+       VCF Installer is deployed
+                  ↑
+          prerequisites validated
+                  ↑
+            JSON submitted
+                  ↑
+               VCF 9
+```
+
+If an engineer has to remember some undocumented magic step during Build #4, **we've discovered another dependency or missing piece of automation.**
+
+That's exactly what repeated lab destruction/reconstruction will teach us.
+
+---
+
+## One nuance: source of truth vs captured end state
+
+I'd make this distinction:
+
+**VCF Installer JSON = desired VCF deployment state.**
+
+**VCF after installation = actual deployed state.**
+
+We want both.
+
+So after every successful build:
+
+```text
+Desired State
+vcf-deployment.json
+        │
+        ▼
+     INSTALL
+        │
+        ▼
+Actual VCF
+        │
+        ▼
+POST-BUILD VALIDATION
+        │
+        ├── expected appliances?
+        ├── expected networks?
+        ├── expected DNS?
+        ├── expected storage?
+        ├── expected hosts?
+        └── expected health?
+```
+
+We're not trying to scrape a manually configured VCF afterward and say, *"Turn this into IaC."*
+
+Instead:
+
+> **Build #1 teaches us what desired state looks like. Builds #2 onward prove that desired state reproduces the same actual state.**
+
+That's much cleaner.
+
+And eventually the offline recovery artifact should probably contain something structurally like:
+
+```text
+vcf-recovery/
+│
+├── README
+│
+├── bootstrap/
+│   ├── recovery-vm.ova
+│   └── bootstrap scripts
+│
+├── vcf/
+│   ├── vcf-installer.ova
+│   └── deployment.json
+│
+├── dns/
+│   └── bootstrap DNS definition
+│
+├── depot/
+│   ├── VCF binaries
+│   └── manifest/checksums
+│
+├── automation/
+│   └── ansible/
+│
+├── validation/
+│   ├── preflight
+│   └── post-build
+│
+└── secrets/
+    └── <secure mechanism TBD>
+```
+
+Not necessarily those exact files—that's what the lab will discover.
+
+But **that directory is effectively the physical embodiment of the bottom brick of our house**.
+
+Once we can repeatedly go:
+
+**ESXi → recovery artifact → VCF 9**
+
+with nothing else assumed except the below-boundary infrastructure and Stratum-1 time source, *then* I think we've earned the right to move one brick upward and ask:
+
+**What must VCF provide to satisfy the RKE2 infrastructure contract?**
+
+That's a very clean stopping point for this phase.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://developer.broadcom.com/xapis/vcf-installer-api/latest/data-structures/?utm_source=chatgpt.com "VMware Cloud Foundation Installer API Reference Guide Data Structures | VCF Installer API"
+[3]: https://developer.broadcom.com/xapis/vcf-installer-api/latest/?utm_source=chatgpt.com "VMware Cloud Foundation Installer API Reference Guide | VCF Installer API"
+
+---
+
+Yes — that gives us a very concrete next phase. And I verified the licensing point: Broadcom says a new VCF 9 instance starts **fully functional in evaluation mode for 90 days**, including the ability to add hosts, workload domains, and clusters. ([VMware Blogs][1]) So the lab is viable without us making licensing part of the bootstrap problem initially.
+
+I would now treat this as our **first implementation phase**, with a deliberately narrow success criterion:
+
+> **Starting only with our established foundation boundary, repeatedly reconstruct a functioning VCF 9 environment using a protected offline recovery package.**
+
+### The VCF-only DAG
+
+Using your bottom-to-roof orientation, our first working DAG can be:
+
+```text
+                         VCF 9 OPERATIONAL
+                                ↑
+                       Post-build validation
+                                ↑
+                          VCF Installer
+                                ↑
+          ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
+   Deployment JSON        VCF 9 binaries       Bootstrap DNS
+          │                     │                     │
+          └─────────────────────┼─────────────────────┘
+                                ↑
+                       Recovery / IaC VM
+                                ↑
+                  Offline recovery artifacts
+                                ↑
+══════════════════ CURRENT FOUNDATION BOUNDARY ══════════════════
+                                ↑
+                       Functional ESXi
+                       Functional storage
+                       Functional networking
+                       Stratum-1 NTP
+```
+
+Everything above `VCF 9 OPERATIONAL` is deliberately out of scope for this test series. No RKE2, Keycloak, AD, RSA, Terraform, GitLab, etc. yet.
+
+One thing we should verify during lab prep is hardware compatibility. Broadcom says most servers certified for vSphere/vSAN 8.x carried forward into VCF 9 support, but we should check the exact Dell blade/NIC/storage combination rather than assume it. ([VMware Blogs][2])
+
+### I like your "couple dozen times" idea
+
+Because the first four tests aren't really four tests that happen once. They're **maturity stages**.
+
+**Test 1 — Learn.** Manually deploy through VCF Installer. Record every input, prerequisite, mistake, precheck, dependency and correction. Get to a healthy VCF. Capture the known-good deployment JSON.
+
+**Test 2 — Reproduce.** Reset the lab to the boundary. Feed the known-good JSON into VCF Installer. Prove that the configuration reproduces VCF without relying on remembered installation decisions.
+
+**Test 3 — Automate.** Build the recovery VM. Bootstrap DNS, expose the offline software depot, deploy/prepare VCF Installer, validate prerequisites, supply the JSON and reduce human interaction as far as practical.
+
+**Test 4 — Recover.** Destroy everything above the boundary. Pretend the organization just called us after the cyber event. Start with only the protected/offline recovery artifacts and reconstruct VCF.
+
+Then repeat Test 4.
+
+Again.
+
+And again.
+
+That's where the interesting engineering discoveries will happen.
+
+If attempt #7 fails because someone forgot that a particular DNS record had been manually created six weeks earlier, **that's not a failed exercise — we've discovered an undocumented dependency**. Add it to the source of truth/automation and run again.
+
+Eventually the goal becomes almost boring:
+
+```text
+DAY-0
+
+Functional ESXi
+      ↑
+Introduce trusted recovery package
+      ↑
+Start Recovery VM
+      ↑
+Validate foundation
+      ↑
+Start bootstrap DNS
+      ↑
+Expose verified VCF depot
+      ↑
+Deploy/start VCF Installer
+      ↑
+Validate deployment JSON
+      ↑
+Deploy
+      ↑
+Validate resulting VCF
+      ↑
+VCF 9 OPERATIONAL
+```
+
+An engineer shouldn't have to remember how the environment was built.
+
+### And I would version the recovery package after every successful iteration
+
+Something conceptually like:
+
+```text
+vcf9-recovery/
+│
+├── VERSION
+├── manifest.json
+│
+├── recovery-vm/
+│   └── recovery.ova
+│
+├── installer/
+│   └── vcf-installer.ova
+│
+├── config/
+│   └── vcf-deployment.json
+│
+├── dns/
+│   └── bootstrap-zone-data
+│
+├── depot/
+│   └── VCF-9.x-binaries/
+│
+├── automation/
+│   ├── bootstrap/
+│   ├── validation/
+│   └── ansible/       # only if we determine it's useful
+│
+├── validation/
+│   ├── preflight
+│   └── post-build
+│
+├── checksums/
+│   └── SHA256SUMS
+│
+└── documentation/
+    └── BREAK-GLASS-RECOVERY.md
+```
+
+The exact structure will emerge from Tests 1–3 rather than us inventing it now.
+
+There's another useful detail for your environment: VCF 9 explicitly supports a **disconnected licensing workflow**. Once this moves beyond evaluation, VCF Operations can use license files obtained through the Broadcom portal rather than requiring the VCF environment itself to have Internet connectivity. ([VMware Blogs][1])
+
+So even licensing fits the eventual air-gapped reconstruction architecture.
+
+I think we've now reached the point where the architecture discussion can turn into an actual lab engineering project. **The next artifact worth creating is the VCF 9 DAG plus a Test 1–4 implementation/checklist register**, with every current assumption marked `CONFIRMED`, `TO VERIFY IN LAB`, or `DISCOVERED DURING BUILD`. That becomes the working document we update through those couple-dozen rebuilds, rather than trying to design the recovery VM perfectly before we've installed VCF once.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/06/24/licensing-in-vmware-cloud-foundation-9-0/?utm_source=chatgpt.com "Licensing in VMware Cloud Foundation 9.0 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2026/02/25/vcf-9-0-server-certification-preserving-your-hardware-investment-and-giving-the-best-roi/?utm_source=chatgpt.com "VCF 9.0 Server Certification: Preserving Your Hardware Investment and giving the best ROI - VMware Cloud Foundation (VCF) Blog"
+
+----
+
+Yes. I’d make this **Version 0.1 of the working VCF 9 recovery DAG/register**. I checked the current Broadcom material again before freezing it: for our greenfield path, VCF Installer replaces Cloud Builder, supports reusable JSON and validation, does not contain the VCF binaries, supports a private offline depot, and a new VCF management cluster requires at least four hosts. ([VMware Blogs][1])
+
+One terminology adjustment: I’ll use **`DISCOVERED DURING BUILD` as an available status**, but initially almost nothing should have it. We haven't built anything yet.
+
+## VCF 9 Day-0 DAG v0.1
+
+```mermaid
+flowchart BT
+
+    %% =========================================================
+    %% FOUNDATION BOUNDARY
+    %% =========================================================
+
+    ESXI["FND-001<br/>Functional ESXi Hosts<br/>CONFIRMED"]
+    NET["FND-002<br/>Physical Network / VLAN / Routing<br/>CONFIRMED"]
+    STORAGE["FND-003<br/>Storage<br/>CONFIRMED"]
+    NTP["FND-004<br/>Stratum-1 NTP<br/>CONFIRMED"]
+
+    BOUNDARY["CURRENT FOUNDATION BOUNDARY<br/>Everything below this point is assumed operational"]
+
+    ESXI --> BOUNDARY
+    NET --> BOUNDARY
+    STORAGE --> BOUNDARY
+    NTP --> BOUNDARY
+
+    %% =========================================================
+    %% RECOVERY / BOOTSTRAP
+    %% =========================================================
+
+    RECOVERY["BOOT-001<br/>Recovery / IaC VM<br/>TO VERIFY IN LAB"]
+    CONFIG["BOOT-002<br/>VCF Deployment JSON<br/>TO VERIFY IN LAB"]
+    DNS["BOOT-003<br/>Bootstrap DNS<br/>TO VERIFY IN LAB"]
+    DEPOT["BOOT-004<br/>Offline VCF Software Depot<br/>CONFIRMED REQUIREMENT"]
+    ARTIFACT["BOOT-005<br/>Offline Recovery Artifacts<br/>TO VERIFY IN LAB"]
+    SECRETS["BOOT-006<br/>Recovery Credentials / Secrets<br/>TO VERIFY IN LAB"]
+
+    BOUNDARY --> RECOVERY
+
+    ARTIFACT --> RECOVERY
+    CONFIG --> RECOVERY
+    SECRETS --> RECOVERY
+
+    RECOVERY --> DNS
+    RECOVERY --> DEPOT
+
+    %% =========================================================
+    %% VCF INSTALLER
+    %% =========================================================
+
+    INSTALLER["VCF-001<br/>VCF Installer Appliance<br/>CONFIRMED"]
+
+    DNS --> INSTALLER
+    DEPOT --> INSTALLER
+    CONFIG --> INSTALLER
+    NTP --> INSTALLER
+    ESXI --> INSTALLER
+    STORAGE --> INSTALLER
+    NET --> INSTALLER
+
+    VALIDATE["VCF-002<br/>Installer Preflight / JSON Validation<br/>CONFIRMED"]
+    INSTALLER --> VALIDATE
+
+    BUILD["VCF-003<br/>VCF 9 Deployment<br/>CONFIRMED"]
+    VALIDATE --> BUILD
+
+    POST["VCF-004<br/>Post-Build Validation<br/>TO VERIFY IN LAB"]
+    BUILD --> POST
+
+    VCF["VCF-005<br/>VCF 9 OPERATIONAL<br/>TARGET STATE"]
+    POST --> VCF
+
+    %% =========================================================
+    %% NEXT PHASE - DELIBERATELY NOT EXPANDED YET
+    %% =========================================================
+
+    CONTRACT["NEXT PHASE<br/>Infrastructure Contract<br/>NOT YET MODELED"]
+    VCF --> CONTRACT
+```
+
+The upward direction is intentional: **ESXi/foundation at the bottom, VCF above it, eventual Mission at the roof.**
+
+Broadcom describes VCF Installer as the Day-0 mechanism that performs prechecks/configuration and can reproduce deployments using downloadable JSON. The API also provides explicit validation of an `SddcSpec`, which gives us something useful to automate instead of merely scripting GUI actions. ([Broadcom Developer][2])
+
+---
+
+# Working implementation/checklist register v0.1
+
+| ID        | Requirement / Activity                                       | Status                              | Test | Evidence / Success Criterion                   |
+| --------- | ------------------------------------------------------------ | ----------------------------------- | ---- | ---------------------------------------------- |
+| FND-001   | Functional ESXi available                                    | **CONFIRMED**                       | All  | Recovery starts here                           |
+| FND-002   | Physical network/routing/VLANs operational                   | **CONFIRMED**                       | All  | Required networks reachable                    |
+| FND-003   | Storage operational                                          | **CONFIRMED**                       | All  | ESXi can access required storage               |
+| FND-004   | Stratum-1 NTP appliance operational                          | **CONFIRMED**                       | All  | NTP reachable from required VCF networks       |
+| FND-005   | Minimum four management hosts available                      | **CONFIRMED requirement**           | 1    | Installer accepts hosts                        |
+| FND-006   | Exact Dell hardware supported by VCF 9                       | **TO VERIFY IN LAB/PREP**           | 0/1  | Compatibility checked                          |
+| FND-007   | ESXi build/version acceptable to VCF 9                       | **TO VERIFY IN LAB**                | 1    | Installer precheck passes                      |
+| NET-001   | Management network definition                                | **TO VERIFY IN LAB**                | 1    | Known-good configuration captured              |
+| NET-002   | vMotion network definition                                   | **TO VERIFY IN LAB**                | 1    | Known-good configuration captured              |
+| NET-003   | vSAN/storage network definition                              | **TO VERIFY IN LAB**                | 1    | Known-good configuration captured              |
+| NET-004   | NSX/network requirements                                     | **TO VERIFY IN LAB**                | 1    | Exact Installer requirements captured          |
+| NET-005   | MTU requirements                                             | **TO VERIFY IN LAB**                | 1    | Precheck passes                                |
+| NET-006   | Required ports/protocols                                     | **TO VERIFY IN LAB**                | 1    | Connectivity tests documented                  |
+| IP-001    | Management IP allocation                                     | **TO VERIFY IN LAB**                | 1    | Complete IP inventory captured                 |
+| IP-002    | VCF appliance IP allocation                                  | **TO VERIFY IN LAB**                | 1    | Complete Installer input captured              |
+| DNS-001   | DNS required during VCF construction                         | **CONFIRMED requirement**           | 1    | Installer dependencies documented              |
+| DNS-002   | Forward DNS records                                          | **TO VERIFY IN LAB**                | 1    | Exact required records identified              |
+| DNS-003   | Reverse DNS records                                          | **TO VERIFY IN LAB**                | 1    | Exact required PTRs identified                 |
+| DNS-004   | DNS hosted on Recovery VM                                    | **TO VERIFY IN LAB**                | 2/3  | VCF successfully builds using it               |
+| DNS-005   | DNS service starts automatically                             | **TO VERIFY IN LAB**                | 3    | Recovery VM reboot requires no manual DNS work |
+| DNS-006   | DNS configuration generated/reconstructed from recovery data | **TO VERIFY IN LAB**                | 3    | No hand-created records                        |
+| NTP-001   | Existing Stratum-1 used by VCF                               | **TO VERIFY IN LAB**                | 1    | Installer accepts/time synchronized            |
+| DEPOT-001 | VCF Installer available offline                              | **CONFIRMED requirement**           | 1    | Installer artifact retained                    |
+| DEPOT-002 | VCF binaries available offline                               | **CONFIRMED requirement**           | 1    | No Internet dependency                         |
+| DEPOT-003 | Private offline depot                                        | **CONFIRMED supported**             | 2    | Installer successfully retrieves binaries      |
+| DEPOT-004 | Depot hosted by Recovery VM                                  | **TO VERIFY IN LAB**                | 2/3  | Architecture proven                            |
+| DEPOT-005 | Depot automatically available after Recovery VM boot         | **TO VERIFY IN LAB**                | 3    | No manual intervention                         |
+| CFG-001   | Initial VCF configuration entered manually                   | **CONFIRMED PLAN**                  | 1    | Successful VCF #1                              |
+| CFG-002   | Known-good VCF deployment JSON captured                      | **CONFIRMED PLAN**                  | 1    | JSON archived                                  |
+| CFG-003   | JSON sufficient to reproduce deployment                      | **TO VERIFY IN LAB**                | 2    | Successful VCF #2                              |
+| CFG-004   | JSON validation automated                                    | **TO VERIFY IN LAB**                | 3    | Invalid config stops deployment                |
+| CFG-005   | JSON becomes canonical VCF deployment definition             | **TO VERIFY IN LAB**                | 2–4  | Repeated rebuilds reproduce target             |
+| SEC-001   | ESXi bootstrap credentials available                         | **TO VERIFY IN LAB**                | 1    | Exact credential requirements known            |
+| SEC-002   | VCF deployment credentials identified                        | **TO VERIFY IN LAB**                | 1    | Complete credential classes documented         |
+| SEC-003   | Secrets protected separately from ordinary configuration     | **TO VERIFY IN LAB**                | 3    | No unprotected secrets in recovery repo        |
+| BOOT-001  | Recovery VM required                                         | **CONFIRMED architecture decision** | 2/3  | Becomes independent bootstrap environment      |
+| BOOT-002  | Recovery VM OS                                               | **TO VERIFY IN LAB**                | 2/3  | Minimal supported design selected              |
+| BOOT-003  | Container runtime required                                   | **TO VERIFY IN LAB**                | 2/3  | Determined by DNS/depot implementation         |
+| BOOT-004  | Ansible required/useful                                      | **TO VERIFY IN LAB**                | 3    | Automation value demonstrated                  |
+| BOOT-005  | Terraform required                                           | **POST-VCF**                        | —    | Excluded from VCF bootstrap                    |
+| BOOT-006  | Container registry required                                  | **POST-VCF**                        | —    | Excluded unless lab proves otherwise           |
+| VCF-001   | VCF Installer deployed                                       | **CONFIRMED requirement**           | 1    | Installer operational                          |
+| VCF-002   | Installer prechecks pass                                     | **TO VERIFY IN LAB**                | 1    | All prerequisites documented                   |
+| VCF-003   | Manual VCF deployment succeeds                               | **TO VERIFY IN LAB**                | 1    | Healthy VCF #1                                 |
+| VCF-004   | JSON-driven deployment succeeds                              | **TO VERIFY IN LAB**                | 2    | Healthy VCF #2                                 |
+| VCF-005   | Automated bootstrap succeeds                                 | **TO VERIFY IN LAB**                | 3    | Healthy VCF #3                                 |
+| VCF-006   | Offline cyber-recovery simulation succeeds                   | **TO VERIFY IN LAB**                | 4    | Healthy VCF #4                                 |
+| VAL-001   | Post-build health criteria defined                           | **TO VERIFY IN LAB**                | 1    | Repeatable validation checklist                |
+| VAL-002   | Post-build validation automated                              | **TO VERIFY IN LAB**                | 3    | Machine-generated pass/fail                    |
+| REC-001   | Complete recovery artifact assembled                         | **TO VERIFY IN LAB**                | 3    | Everything necessary stored offline            |
+| REC-002   | Artifact integrity/checksums validated                       | **TO VERIFY IN LAB**                | 3/4  | Tampering/corruption detectable                |
+| REC-003   | Recovery possible without Internet                           | **TO VERIFY IN LAB**                | 4    | Zero external Internet dependency              |
+| REC-004   | Recovery possible without AD                                 | **TO VERIFY IN LAB**                | 4    | AD absent during rebuild                       |
+| REC-005   | Recovery possible without GitLab                             | **TO VERIFY IN LAB**                | 4    | GitLab absent during rebuild                   |
+| REC-006   | Recovery possible without RKE2                               | **TO VERIFY IN LAB**                | 4    | RKE2 absent during rebuild                     |
+| REC-007   | Recovery requires no undocumented human knowledge            | **TO VERIFY IN LAB**                | 4+   | Another qualified engineer can execute         |
+
+Broadcom confirms the VCF Installer can use the wizard or reusable JSON, and that the JSON can be reviewed and validated. It also confirms the Installer doesn't carry the product binaries, making the offline depot a real external dependency rather than something we're inventing for our architecture. ([VMware Blogs][1])
+
+## Test 1 — Learn and capture
+
+The goal is **not automation**. It's to discover reality.
+
+Start from our boundary, manually deploy the VCF Installer and use its normal wizard. Every time we have to answer a question, create something, fix DNS, change an IP, adjust an MTU, supply a password, download an artifact or resolve a precheck, it goes into the register.
+
+Success is:
+
+```text
+Functional ESXi
+      ↑
+VCF Installer
+      ↑
+Manual configuration
+      ↑
+All prechecks pass
+      ↑
+VCF 9 builds
+      ↑
+VCF healthy
+      ↑
+Known-good JSON captured
+```
+
+Broadcom's planning guidance specifically recommends collecting the infrastructure prerequisites/configuration before transferring those inputs into VCF Installer. ([VMware Blogs][3])
+
+Every new fact learned becomes:
+
+**`DISCOVERED DURING BUILD`**
+
+For example:
+
+> `DNS-017 | Installer requires PTR for component X | DISCOVERED DURING BUILD | Test 1 | Failure XYZ disappeared after PTR creation`
+
+That's how this becomes institutional engineering knowledge rather than someone's notebook.
+
+## Test 2 — Reproduce
+
+Destroy VCF #1.
+
+Return to the boundary.
+
+This time use the captured JSON rather than rebuilding the design from memory. Broadcom explicitly supports saving JSON for future builds/reference. ([VMware Blogs][4])
+
+Success criterion:
+
+> **Same starting boundary + known-good configuration → equivalent healthy VCF.**
+
+This is where `CFG-003` can move:
+
+```text
+TO VERIFY IN LAB
+        ↓
+    CONFIRMED
+```
+
+And importantly, **Test 2 tells us whether our JSON really represents the desired state**.
+
+## Test 3 — Automate
+
+Now build `BOOT-001`.
+
+At this stage we're allowed to decide whether it contains:
+
+```text
+Recovery VM
+│
+├── VCF recovery automation
+│
+├── VCF deployment JSON
+│
+├── validation scripts
+│
+├── DNS container/service
+│
+├── offline depot service
+│
+└── Ansible
+     └── ONLY where we've demonstrated a need
+```
+
+I like this discipline:
+
+> **Nothing gets installed on the Recovery VM merely because it might be useful. Every component must satisfy a dependency discovered in Tests 1 or 2.**
+
+That's how we avoid building another platform underneath the platform.
+
+The VCF Installer API gives us an especially useful automation point: Broadcom exposes an API operation specifically to validate the SDDC specification before deployment. ([Broadcom Developer][2])
+
+## Test 4 — Recover
+
+Then we deliberately simulate the cyber event:
+
+```text
+DESTROY / ASSUME LOST
+
+vCenter        X
+VCF            X
+AD             X
+Enterprise DNS X
+Keycloak       X
+RSA integration X
+GitLab         X
+RKE2           X
+Repositories   X
+Management apps X
+
+----------------------------
+
+SURVIVES
+
+ESXi           ✓
+Storage        ✓
+Network        ✓
+Stratum-1 NTP  ✓
+Recovery media ✓
+```
+
+Give an engineer the recovery package.
+
+The success criterion isn't merely:
+
+> “VCF came back.”
+
+It's:
+
+> **Starting only from the defined foundation boundary and protected recovery artifacts, a qualified engineer can reconstruct a validated VCF 9 environment without Internet connectivity, enterprise AD/DNS, GitLab, RKE2, or undocumented institutional knowledge.**
+
+That's much stronger.
+
+### And then Tests 5–25 are basically Test 4
+
+This is where your “couple dozen times” becomes valuable.
+
+Each iteration should have a very simple result:
+
+```text
+TEST-04-07
+
+Result: FAIL
+
+Failure:
+VCF Installer could not resolve ______
+
+Cause:
+Bootstrap DNS generation omitted ______
+
+Register:
+DNS-023
+DISCOVERED DURING BUILD
+
+Fix:
+Update recovery configuration/generator
+
+Recovery Package:
+v0.7 → v0.8
+
+RETEST
+```
+
+Eventually:
+
+```text
+TEST-04-22
+
+Fresh ESXi boundary
+       ↑
+Recovery package v2.6
+       ↑
+Automated bootstrap
+       ↑
+VCF Installer
+       ↑
+VCF deployment
+       ↑
+Automated validation
+       ↑
+
+PASS
+```
+
+At that point we have something much more valuable than a VCF installation.
+
+We have a **tested VCF reconstruction capability**.
+
+And that becomes our first genuinely proven brick:
+
+```text
+                         MISSION
+                            ↑
+                           ...
+                            ↑
+                         RKE2
+                            ↑
+                 Infrastructure Contract
+                            ↑
+                   ┌────────────────┐
+                   │     VCF 9      │
+                   │ PROVEN BRICK #1│
+                   └────────────────┘
+                            ↑
+                    Recovery / IaC
+                            ↑
+════════════════ CURRENT FOUNDATION BOUNDARY ════════════════
+                            ↑
+                       ESXi / NTP
+                  Network / Storage
+```
+
+Then—and only then—we move upward and define exactly what **VCF must provide to the portable RKE2 deployment**. That will give us the next dependency matrix instead of guessing what the “infrastructure contract” contains.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://developer.broadcom.com/xapis/vcf-installer-api/latest/v1/sddcs/validations/post/?utm_source=chatgpt.com "Validate Sddc Spec | VCF Installer API"
+[3]: https://blogs.vmware.com/cloud-foundation/2025/07/28/planning-a-successful-vmware-cloud-foundation-9-0-deployment/?utm_source=chatgpt.com "Planning a Successful VMware Cloud Foundation 9.0 Deployment - VMware Cloud Foundation (VCF) Blog"
+[4]: https://blogs.vmware.com/cloud-foundation/2025/06/17/modern-infrastructure-operations-vcf-9-0/?utm_source=chatgpt.com "Operations in VMware Cloud Foundation 9.0 : The Modern Way to Build and Manage Your Private Cloud - VMware Cloud Foundation (VCF) Blog"
+
+---
+
+
