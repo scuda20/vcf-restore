@@ -4187,4 +4187,2148 @@ Then—and only then—we move upward and define exactly what **VCF must provide
 
 ---
 
+Yes. I think you've just turned the **Recovery VM** into something more useful than a break-glass appliance: it becomes the **VCF bootstrap/recovery control point**.
+
+Broadcom's model supports the core of this idea. VCF 9's Installer does not contain the product binaries and can consume them from a private offline depot; Broadcom describes that depot as a self-managed web server hosting the software repository. ([VMware Blogs][1]) So using Nginx on this VM to serve the VCF depot is architecturally reasonable.
+
+The one thing I'd change in your wording is **"automatically download the latest binaries."** I would automate **discovery/download into staging**, but not automatically promote "latest" into the recovery baseline. Broadcom changed its download mechanism to authenticated/token-based downloads, so the pipeline will need to account for that, and a newly published bundle shouldn't become our disaster-recovery version until we've actually rebuilt the lab with it. ([VMware Blogs][2])
+
+### I think the VM is becoming this
+
+```text
+                         VCF 9 OPERATIONAL
+                                ↑
+                       VCF Installer API
+                                ↑
+             ┌──────────────────┼──────────────────┐
+             │                  │                  │
+        VCF JSON           Bootstrap DNS      VCF Depot
+                                                  ↑
+                                                Nginx
+             └──────────────────┬──────────────────┘
+                                ↑
+                    VCF RECOVERY / IaC VM
+                                │
+                    ┌───────────┼───────────┐
+                    │           │           │
+                 Validate    Deploy       Report
+                    │           │           │
+                    └───────────┼───────────┘
+                                ↑
+══════════════════ CURRENT FOUNDATION BOUNDARY ══════════════════
+                                ↑
+                 ESXi / Network / Storage / NTP
+```
+
+I'd probably run **Nginx and DNS as containers**, while keeping the orchestration/validation code directly on the VM or in another controlled container. That gives us a very small number of moving parts without requiring Kubernetes, a registry, GitLab, AD, or anything else above the recovery boundary.
+
+### The CI/CD idea is where this gets especially strong
+
+I wouldn't make the cadence itself the important thing. Monthly or quarterly can be decided later. I'd make the workflow:
+
+```text
+Broadcom releases/approves new VCF artifacts
+                    │
+                    ▼
+             DOWNLOAD / STAGE
+                    │
+                    ▼
+             Verify signatures
+              and checksums
+                    │
+                    ▼
+            CANDIDATE BASELINE
+                    │
+                    ▼
+           Rebuild lab from ESXi
+                    │
+                    ▼
+          Run VCF Installer JSON
+                    │
+                    ▼
+         Automated VCF validation
+                    │
+              ┌─────┴─────┐
+              │           │
+            FAIL         PASS
+              │           │
+          Quarantine    Generate
+          candidate     evidence
+                          │
+                          ▼
+                   APPROVED BASELINE
+                          │
+                          ▼
+                 Offline Recovery Set
+```
+
+That is much safer than:
+
+`Broadcom releases 9.x.y → production recovery depot automatically becomes 9.x.y`.
+
+Instead, the pipeline proves that **our configuration + that exact software BOM + our hardware + our recovery process actually works** before promotion.
+
+VCF 9 is well suited to this because Broadcom explicitly describes the Installer as providing GUI/API workflows, prechecks and reusable downloadable JSON for replicating deployments. ([VMware Blogs][3])
+
+And once VCF exists, lifecycle management moves into VCF Operations, where the online/offline depot is configured for subsequent lifecycle operations. ([VMware Blogs][4]) So we should distinguish **Day-0 recovery depot** from **Day-2 VCF lifecycle management**, even if eventually they consume the same protected binary repository.
+
+### Your NOC point changes one of our requirements
+
+I think we should explicitly add a requirement to the DAG/register:
+
+**`BOOT-007 — Operator Recovery Interface` — `TO VERIFY IN LAB`**
+
+The requirement shouldn't be "NOC knows how to build VCF."
+
+It should be:
+
+> **An authorized NOC operator can initiate a pre-approved VCF recovery workflow without needing detailed VCF implementation knowledge or the ability to modify the approved deployment design.**
+
+That lets us build toward something like:
+
+```text
+NOC at 01:00
+
+1. Deploy/start approved Recovery VM
+2. Select: "Recover VCF"
+3. Select approved baseline
+4. Run preflight
+
+       ↓
+
+FOUNDATION CHECK
+ESXi ............ PASS
+Storage ......... PASS
+Network ........ PASS
+NTP ............. PASS
+DNS ............. PASS
+VCF Depot ....... PASS
+Artifacts ....... PASS
+JSON ............. PASS
+Credentials ...... PASS
+
+       ↓
+
+START RECOVERY
+
+       ↓
+
+[automation + VCF Installer]
+
+       ↓
+
+POST-BUILD VALIDATION
+
+       ↓
+
+Recovery Report
+```
+
+That addresses the "cowboy" problem technically rather than procedurally. Instead of a 75-page SOP saying *please don't deviate from these instructions*, the **approved path is the easiest path**.
+
+Senior engineers can still troubleshoot when something fails, but the normal recovery path becomes deterministic.
+
+I would go one step further: **the NOC should not normally be able to edit `vcf-deployment.json`.** They execute an approved, signed/versioned recovery baseline. Changing the architecture is an engineering action, not an incident-recovery action.
+
+### That gives us three distinct artifact states
+
+This is important for the register:
+
+**Candidate** → downloaded but never trusted for recovery.
+
+**Validated** → successfully reconstructed the lab and passed automated validation.
+
+**Approved Recovery Baseline** → validated version formally selected for recovery.
+
+So we could have:
+
+```text
+VCF 9.0.2
+CANDIDATE
+    ↓
+Lab rebuild #31
+    ↓
+PASS
+    ↓
+VALIDATED
+    ↓
+Approval
+    ↓
+RECOVERY BASELINE 2026-Q4
+```
+
+And don't delete the previous known-good baseline when a new one passes. Keep at least a defined number of prior recovery sets.
+
+That also gives your CI/CD pipeline a genuinely meaningful output: not simply **"pipeline succeeded,"** but a versioned verification report containing the VCF version/BOM, artifact hashes, recovery configuration version, preflight results, deployment result, elapsed time, post-build health checks and final PASS/FAIL.
+
+### One subtle but important change to our DAG
+
+Nginx itself isn't really the dependency.
+
+The dependency is:
+
+```text
+BOOT-004
+VCF Offline Software Depot
+        ↑
+BOOT-004A
+HTTP/HTTPS Depot Service
+        ↑
+BOOT-004B
+Nginx
+```
+
+`Nginx` is an **implementation choice**.
+
+That keeps our DAG from becoming obsolete if five years from now we replace Nginx with something else. The requirement remains: *VCF Installer needs a reachable, validated offline software depot.*
+
+And Broadcom's older offline-depot guidance actually uses exactly this general architecture: a self-managed web server with sufficient storage, HTTPS, authentication, and the required repository structure. ([VMware Blogs][5])
+
+So I think this is a meaningful evolution of `BOOT-001`:
+
+> **The VCF Recovery/IaC VM is a self-contained, independently recoverable control point that hosts the minimum services, configuration, validated software artifacts and automation necessary to reconstruct VCF from the defined foundation boundary.**
+
+And now we have a second role:
+
+> **During normal operations, the same recovery architecture continuously validates future recovery baselines by reconstructing VCF in the lab and producing auditable verification evidence.**
+
+That second sentence is important. We're no longer merely building **disaster recovery documentation**.
+
+We're building a **continuously tested reconstruction capability**.
+
+I would update the Excel next with this model—adding the **Candidate → Validated → Approved Baseline pipeline, NOC operator workflow, Nginx/depot implementation nodes, automated verification report, artifact integrity, and rollback/previous-baseline requirements** while preserving the existing register and Test 1–4 structure.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2025/03/24/download-changes-vmware-software-binaries/?utm_source=chatgpt.com "Important Update: Changes to How You Download VMware Software Binaries - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2025/06/17/vcf-9-0-use-cases/?utm_source=chatgpt.com "VMware Cloud Foundation 9.0: Modernize Infrastructure, Accelerate App Delivery, and Strengthen Security and Resiliency - VMware Cloud Foundation (VCF) Blog"
+[4]: https://blogs.vmware.com/cloud-foundation/2026/02/06/why-vcf-9-0-improves-it-operations-and-management/?utm_source=chatgpt.com "Why VCF 9.0 Improves IT Operations and Management - VMware Cloud Foundation (VCF) Blog"
+[5]: https://blogs.vmware.com/cloud-foundation/2024/07/24/vmware-cloud-foundation-offline-depot-introduction/?utm_source=chatgpt.com "VMware Cloud Foundation Offline Depot Introduction - VMware Cloud Foundation (VCF) Blog"
+
+---
+
+That clarification makes the promotion model much stronger. Your **staging environment is the trust gate**, while production remains air-gapped and receives only a manually transferred, already-proven release.
+
+I would formalize the lifecycle like this:
+
+```text
+Broadcom Candidate
+        ↑
+Restricted-Internet Staging
+        ↑
+Automated Download + Integrity Validation
+        ↑
+Automated Clean VCF Reconstruction
+        ↑
+Automated Verification Report
+        ↑
+Senior Engineer Review
+        ↑
+Independent Witness Rebuild / Verification
+        ↑
+APPROVED RECOVERY BASELINE
+        ↑
+Manual Air-Gap Transfer
+        ↑
+Production Offline Recovery Repository
+```
+
+That is substantially different from merely mirroring Broadcom binaries into production. **Nothing crosses the air gap merely because Broadcom released it.**
+
+### I especially like the serial-number concept
+
+I would implement it, but make it slightly more capable than the old RHEL template serial number.
+
+Instead of just a secret serial number, create a **build provenance marker**. It can still contain a hidden team-verification value, but it should identify exactly *what approved process produced the environment*.
+
+Conceptually:
+
+```text
+VCF Recovery Provenance
+
+Baseline ID:       VCF9-REC-2026Q4-003
+VCF Version:       9.x.x
+Config Revision:   7f3a91...
+Artifact Manifest: SHA256:...
+Pipeline Run:      STAGE-0047
+Validation:        PASS
+Approval ID:       REL-2026-004
+Build Timestamp:   ...
+Build Serial:      <team verification value>
+```
+
+The public/non-secret fields give you useful engineering provenance. The hidden value gives your team the quick test you're describing.
+
+Then the question when someone says, *"VCF is messed up; your recovery process didn't work,"* isn't subjective:
+
+```text
+$ verify-vcf-build
+
+Approved baseline:  VCF9-REC-2026Q4-003
+Provenance:         VALID
+Artifact manifest:  MATCH
+Configuration:      MATCH
+Build serial:       VALID
+Deployment method:  APPROVED PIPELINE
+
+Result: APPROVED BUILD
+```
+
+versus:
+
+```text
+$ verify-vcf-build
+
+Provenance:         NOT FOUND
+
+Result:
+ENVIRONMENT WAS NOT CREATED BY
+THE APPROVED RECOVERY WORKFLOW
+```
+
+That's much more useful than trying to reconstruct what somebody did at 01:00 three months later.
+
+## But don't rely on secrecy alone
+
+This is the one place I'd change your old method.
+
+A hidden serial number is useful as a **canary**, but an engineer who learns where it's stored could copy it into a manually built environment.
+
+For this system, I'd use a **cryptographically signed provenance record**.
+
+The pipeline creates the record, but only the controlled approval/release process can sign it. Production verification uses the corresponding public key.
+
+Conceptually:
+
+```text
+Approved configuration
+        +
+VCF artifact hashes
+        +
+Recovery baseline ID
+        +
+Pipeline results
+        +
+Build identifier
+        │
+        ▼
+   Provenance Manifest
+        │
+        ▼
+  SIGN WITH RELEASE KEY
+        │
+        ▼
+manifest.json
+manifest.sig
+```
+
+Verification requires no secret in production:
+
+```text
+manifest.json
+      +
+manifest.sig
+      +
+Release Public Key
+      │
+      ▼
+VERIFY SIGNATURE
+      │
+  ┌───┴───┐
+VALID   INVALID
+```
+
+You can still embed your hidden S/N inside the signed manifest if you want the old quick forensic indicator.
+
+Now an engineer can't just type the expected serial number into a manually built environment and make it approved. They would also need to produce a valid release signature.
+
+### This gives us another very useful control: deployment provenance
+
+I'd add these to our register:
+
+| ID       | Requirement                                                    | Initial Status                |
+| -------- | -------------------------------------------------------------- | ----------------------------- |
+| GOV-001  | Only validated VCF candidates may become recovery baselines    | **CONFIRMED**                 |
+| GOV-002  | Automated candidate reconstruction required                    | **CONFIRMED**                 |
+| GOV-003  | Automated verification report required                         | **CONFIRMED**                 |
+| GOV-004  | Senior engineer manual verification required                   | **CONFIRMED**                 |
+| GOV-005  | Independent/witness rebuild before release                     | **CONFIRMED**                 |
+| GOV-006  | Production release crosses air gap manually                    | **CONFIRMED**                 |
+| GOV-007  | Production receives only approved recovery baseline            | **CONFIRMED**                 |
+| PROV-001 | Every approved deployment receives unique build provenance     | **CONFIRMED**                 |
+| PROV-002 | Provenance identifies exact recovery baseline/config/artifacts | **TO VERIFY IN LAB**          |
+| PROV-003 | Approved provenance cryptographically signed                   | **TO VERIFY IN LAB**          |
+| PROV-004 | Verification possible offline using public key                 | **TO VERIFY IN LAB**          |
+| PROV-005 | Hidden build serial/canary included                            | **CONFIRMED design decision** |
+| PROV-006 | NOC cannot generate approved provenance independently          | **TO VERIFY IN LAB**          |
+| PROV-007 | Provenance check included in post-build validation             | **TO VERIFY IN LAB**          |
+
+And this actually strengthens your NOC/cowboy control considerably.
+
+The NOC isn't given:
+
+> "Here are the instructions for installing VCF."
+
+They're given:
+
+> **"Here is the approved recovery workflow. Start it."**
+
+Engineers aren't given:
+
+> "Here are the instructions; please follow them."
+
+Instead:
+
+> **"Only the controlled workflow produces valid deployment provenance."**
+
+That changes behavior because deviations become observable.
+
+### The 01:00 NOC experience should eventually be almost boring
+
+Something along these lines:
+
+```text
+=================================================
+       VCF 9 DISASTER RECOVERY
+=================================================
+
+Approved Baseline
+  VCF9-REC-2026Q4-003
+
+VCF Version
+  9.x.x
+
+Release Status
+  APPROVED
+
+Engineering Validation
+  PASS
+
+Air-Gap Release Verification
+  PASS
+
+-------------------------------------------------
+
+[1] Validate Recovery Prerequisites
+[2] Begin VCF Recovery
+[3] View Recovery Status
+[4] Generate Recovery Report
+
+-------------------------------------------------
+Architecture modification requires Engineering.
+=================================================
+```
+
+They run **Validate**.
+
+If ESXi, network, storage, NTP, DNS, depot, JSON, artifact integrity or required credentials don't pass, the system doesn't present a clever NOC technician with 15 ways to improvise.
+
+It stops:
+
+```text
+RECOVERY BLOCKED
+
+NET-004: Required management network unavailable.
+
+Expected:  x
+Observed:  y
+
+No infrastructure changes were performed.
+
+Escalation: Senior Infrastructure Engineering
+```
+
+That's exactly where we *want* junior operations personnel to stop.
+
+And frankly, it's where we want the cowboy senior engineer to stop too. :-)
+
+### Our DAG is getting an interesting new branch
+
+It's no longer just recovery dependencies:
+
+```text
+                         VCF OPERATIONAL
+                                ↑
+                    Approved Recovery Workflow
+                                ↑
+                    Approved Recovery Baseline
+                                ↑
+               ┌────────────────┼────────────────┐
+               ↑                ↑                ↑
+         VCF Artifacts     Deployment JSON    Provenance
+               ↑                ↑                ↑
+               └────────────────┼────────────────┘
+                                ↑
+                    RELEASE APPROVAL GATE
+                                ↑
+                  Senior Engineer Verification
+                                ↑
+                     Automated Lab Rebuild
+                                ↑
+                   Automated Verification
+                                ↑
+                       Candidate Release
+                                ↑
+                    Broadcom Software Depot
+```
+
+The **left side of our architecture becomes supply/promotion**, while the **bottom-to-top path remains reconstruction**.
+
+Those two paths meet at **Approved Recovery Baseline**.
+
+That is a very clean architecture.
+
+And it gives us something I hadn't appreciated when we first started discussing the recovery VM: the same system can continuously answer a very important question:
+
+> **"Do we know, based on actual evidence, that the artifacts currently sitting in our production recovery repository can reconstruct our VCF environment from the declared Day-0 boundary?"**
+
+Instead of answering *"It should; we tested it last year,"* your team can answer:
+
+> **"Yes. Baseline X was reconstructed from scratch in staging, passed automated validation, was independently observed and approved, was cryptographically sealed, and that exact artifact set was transferred across the air gap."**
+
+That's precisely the kind of evidence I'd want the Excel register to start tracking as we build this out.
+
+---
+That clarification makes the promotion model much stronger. Your **staging environment is the trust gate**, while production remains air-gapped and receives only a manually transferred, already-proven release.
+
+I would formalize the lifecycle like this:
+
+```text
+Broadcom Candidate
+        ↑
+Restricted-Internet Staging
+        ↑
+Automated Download + Integrity Validation
+        ↑
+Automated Clean VCF Reconstruction
+        ↑
+Automated Verification Report
+        ↑
+Senior Engineer Review
+        ↑
+Independent Witness Rebuild / Verification
+        ↑
+APPROVED RECOVERY BASELINE
+        ↑
+Manual Air-Gap Transfer
+        ↑
+Production Offline Recovery Repository
+```
+
+That is substantially different from merely mirroring Broadcom binaries into production. **Nothing crosses the air gap merely because Broadcom released it.**
+
+### I especially like the serial-number concept
+
+I would implement it, but make it slightly more capable than the old RHEL template serial number.
+
+Instead of just a secret serial number, create a **build provenance marker**. It can still contain a hidden team-verification value, but it should identify exactly *what approved process produced the environment*.
+
+Conceptually:
+
+```text
+VCF Recovery Provenance
+
+Baseline ID:       VCF9-REC-2026Q4-003
+VCF Version:       9.x.x
+Config Revision:   7f3a91...
+Artifact Manifest: SHA256:...
+Pipeline Run:      STAGE-0047
+Validation:        PASS
+Approval ID:       REL-2026-004
+Build Timestamp:   ...
+Build Serial:      <team verification value>
+```
+
+The public/non-secret fields give you useful engineering provenance. The hidden value gives your team the quick test you're describing.
+
+Then the question when someone says, *"VCF is messed up; your recovery process didn't work,"* isn't subjective:
+
+```text
+$ verify-vcf-build
+
+Approved baseline:  VCF9-REC-2026Q4-003
+Provenance:         VALID
+Artifact manifest:  MATCH
+Configuration:      MATCH
+Build serial:       VALID
+Deployment method:  APPROVED PIPELINE
+
+Result: APPROVED BUILD
+```
+
+versus:
+
+```text
+$ verify-vcf-build
+
+Provenance:         NOT FOUND
+
+Result:
+ENVIRONMENT WAS NOT CREATED BY
+THE APPROVED RECOVERY WORKFLOW
+```
+
+That's much more useful than trying to reconstruct what somebody did at 01:00 three months later.
+
+## But don't rely on secrecy alone
+
+This is the one place I'd change your old method.
+
+A hidden serial number is useful as a **canary**, but an engineer who learns where it's stored could copy it into a manually built environment.
+
+For this system, I'd use a **cryptographically signed provenance record**.
+
+The pipeline creates the record, but only the controlled approval/release process can sign it. Production verification uses the corresponding public key.
+
+Conceptually:
+
+```text
+Approved configuration
+        +
+VCF artifact hashes
+        +
+Recovery baseline ID
+        +
+Pipeline results
+        +
+Build identifier
+        │
+        ▼
+   Provenance Manifest
+        │
+        ▼
+  SIGN WITH RELEASE KEY
+        │
+        ▼
+manifest.json
+manifest.sig
+```
+
+Verification requires no secret in production:
+
+```text
+manifest.json
+      +
+manifest.sig
+      +
+Release Public Key
+      │
+      ▼
+VERIFY SIGNATURE
+      │
+  ┌───┴───┐
+VALID   INVALID
+```
+
+You can still embed your hidden S/N inside the signed manifest if you want the old quick forensic indicator.
+
+Now an engineer can't just type the expected serial number into a manually built environment and make it approved. They would also need to produce a valid release signature.
+
+### This gives us another very useful control: deployment provenance
+
+I'd add these to our register:
+
+| ID       | Requirement                                                    | Initial Status                |
+| -------- | -------------------------------------------------------------- | ----------------------------- |
+| GOV-001  | Only validated VCF candidates may become recovery baselines    | **CONFIRMED**                 |
+| GOV-002  | Automated candidate reconstruction required                    | **CONFIRMED**                 |
+| GOV-003  | Automated verification report required                         | **CONFIRMED**                 |
+| GOV-004  | Senior engineer manual verification required                   | **CONFIRMED**                 |
+| GOV-005  | Independent/witness rebuild before release                     | **CONFIRMED**                 |
+| GOV-006  | Production release crosses air gap manually                    | **CONFIRMED**                 |
+| GOV-007  | Production receives only approved recovery baseline            | **CONFIRMED**                 |
+| PROV-001 | Every approved deployment receives unique build provenance     | **CONFIRMED**                 |
+| PROV-002 | Provenance identifies exact recovery baseline/config/artifacts | **TO VERIFY IN LAB**          |
+| PROV-003 | Approved provenance cryptographically signed                   | **TO VERIFY IN LAB**          |
+| PROV-004 | Verification possible offline using public key                 | **TO VERIFY IN LAB**          |
+| PROV-005 | Hidden build serial/canary included                            | **CONFIRMED design decision** |
+| PROV-006 | NOC cannot generate approved provenance independently          | **TO VERIFY IN LAB**          |
+| PROV-007 | Provenance check included in post-build validation             | **TO VERIFY IN LAB**          |
+
+And this actually strengthens your NOC/cowboy control considerably.
+
+The NOC isn't given:
+
+> "Here are the instructions for installing VCF."
+
+They're given:
+
+> **"Here is the approved recovery workflow. Start it."**
+
+Engineers aren't given:
+
+> "Here are the instructions; please follow them."
+
+Instead:
+
+> **"Only the controlled workflow produces valid deployment provenance."**
+
+That changes behavior because deviations become observable.
+
+### The 01:00 NOC experience should eventually be almost boring
+
+Something along these lines:
+
+```text
+=================================================
+       VCF 9 DISASTER RECOVERY
+=================================================
+
+Approved Baseline
+  VCF9-REC-2026Q4-003
+
+VCF Version
+  9.x.x
+
+Release Status
+  APPROVED
+
+Engineering Validation
+  PASS
+
+Air-Gap Release Verification
+  PASS
+
+-------------------------------------------------
+
+[1] Validate Recovery Prerequisites
+[2] Begin VCF Recovery
+[3] View Recovery Status
+[4] Generate Recovery Report
+
+-------------------------------------------------
+Architecture modification requires Engineering.
+=================================================
+```
+
+They run **Validate**.
+
+If ESXi, network, storage, NTP, DNS, depot, JSON, artifact integrity or required credentials don't pass, the system doesn't present a clever NOC technician with 15 ways to improvise.
+
+It stops:
+
+```text
+RECOVERY BLOCKED
+
+NET-004: Required management network unavailable.
+
+Expected:  x
+Observed:  y
+
+No infrastructure changes were performed.
+
+Escalation: Senior Infrastructure Engineering
+```
+
+That's exactly where we *want* junior operations personnel to stop.
+
+And frankly, it's where we want the cowboy senior engineer to stop too. :-)
+
+### Our DAG is getting an interesting new branch
+
+It's no longer just recovery dependencies:
+
+```text
+                         VCF OPERATIONAL
+                                ↑
+                    Approved Recovery Workflow
+                                ↑
+                    Approved Recovery Baseline
+                                ↑
+               ┌────────────────┼────────────────┐
+               ↑                ↑                ↑
+         VCF Artifacts     Deployment JSON    Provenance
+               ↑                ↑                ↑
+               └────────────────┼────────────────┘
+                                ↑
+                    RELEASE APPROVAL GATE
+                                ↑
+                  Senior Engineer Verification
+                                ↑
+                     Automated Lab Rebuild
+                                ↑
+                   Automated Verification
+                                ↑
+                       Candidate Release
+                                ↑
+                    Broadcom Software Depot
+```
+
+The **left side of our architecture becomes supply/promotion**, while the **bottom-to-top path remains reconstruction**.
+
+Those two paths meet at **Approved Recovery Baseline**.
+
+That is a very clean architecture.
+
+And it gives us something I hadn't appreciated when we first started discussing the recovery VM: the same system can continuously answer a very important question:
+
+> **"Do we know, based on actual evidence, that the artifacts currently sitting in our production recovery repository can reconstruct our VCF environment from the declared Day-0 boundary?"**
+
+Instead of answering *"It should; we tested it last year,"* your team can answer:
+
+> **"Yes. Baseline X was reconstructed from scratch in staging, passed automated validation, was independently observed and approved, was cryptographically sealed, and that exact artifact set was transferred across the air gap."**
+
+That's precisely the kind of evidence I'd want the Excel register to start tracking as we build this out.
+
+---
+Absolutely. I’d update the DAG so the **Recovery/IaC VM is a self-contained bootstrap control point**, with the self-hosted VCF software repository as one of its services. I’m also showing the **staging/promotion path separately from the production recovery path**, because those are now two distinct dependency chains.
+
+```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background':'#ffffff',
+  'primaryColor':'#f5f5f5',
+  'primaryTextColor':'#111111',
+  'primaryBorderColor':'#333333',
+  'lineColor':'#222222',
+  'secondaryColor':'#ffffff',
+  'tertiaryColor':'#ffffff'
+}}}%%
+
+flowchart BT
+
+    %% =========================================================
+    %% FOUNDATION BOUNDARY
+    %% =========================================================
+
+    ESXI["FND-001<br/>Functional ESXi Hosts<br/>CONFIRMED"]
+    NET["FND-002<br/>Physical Network / VLAN / Routing<br/>CONFIRMED"]
+    STORAGE["FND-003<br/>Storage<br/>CONFIRMED"]
+    NTP["FND-004<br/>Stratum-1 NTP Appliance<br/>CONFIRMED"]
+
+    BOUNDARY["CURRENT FOUNDATION BOUNDARY<br/>Everything below this point is assumed operational"]
+
+    ESXI --> BOUNDARY
+    NET --> BOUNDARY
+    STORAGE --> BOUNDARY
+    NTP --> BOUNDARY
+
+
+    %% =========================================================
+    %% STAGING / CANDIDATE ACQUISITION
+    %% =========================================================
+
+    BROADCOM["EXT-001<br/>Broadcom Software Depot"]
+    DOWNLOAD["REL-001<br/>Candidate Artifact Download<br/>CONFIRMED"]
+    CANDIDATE["REL-002<br/>Candidate VCF Baseline"]
+    INTEGRITY["REL-003<br/>Artifact Integrity / Hash Validation<br/>CONFIRMED"]
+
+    BROADCOM --> DOWNLOAD
+    DOWNLOAD --> INTEGRITY
+    INTEGRITY --> CANDIDATE
+
+
+    %% =========================================================
+    %% STAGING VALIDATION
+    %% =========================================================
+
+    STAGEDEPOT["REL-004<br/>Staging Self-Hosted VCF Repository<br/>Nginx / HTTPS<br/>TO VERIFY IN LAB"]
+
+    AUTOBUILD["REL-005<br/>Automated Clean Lab Reconstruction<br/>TO VERIFY IN LAB"]
+
+    AUTOTEST["REL-006<br/>Automated Post-Build Validation<br/>TO VERIFY IN LAB"]
+
+    REPORT["REL-007<br/>Automated Verification Report<br/>TO VERIFY IN LAB"]
+
+    SENIOR["REL-008<br/>Senior Engineer Manual Verification<br/>CONFIRMED"]
+
+    WITNESS["REL-009<br/>Independent / Witness Rebuild<br/>CONFIRMED"]
+
+    APPROVED["REL-010<br/>APPROVED RECOVERY BASELINE"]
+
+    CANDIDATE --> STAGEDEPOT
+    STAGEDEPOT --> AUTOBUILD
+    AUTOBUILD --> AUTOTEST
+    AUTOTEST --> REPORT
+    REPORT --> SENIOR
+    SENIOR --> WITNESS
+    WITNESS --> APPROVED
+
+
+    %% =========================================================
+    %% AIR-GAP RELEASE
+    %% =========================================================
+
+    TRANSFER["REL-011<br/>Controlled Manual Air-Gap Transfer<br/>CONFIRMED"]
+
+    PRODREPO["BOOT-004<br/>Production Self-Hosted VCF Repository<br/>Nginx / HTTPS<br/>TO VERIFY IN LAB"]
+
+    APPROVED --> TRANSFER
+    TRANSFER --> PRODREPO
+
+
+    %% =========================================================
+    %% RECOVERY / IaC CONTROL POINT
+    %% =========================================================
+
+    RECOVERY["BOOT-001<br/>VCF Recovery / IaC VM<br/>CONFIRMED ARCHITECTURE"]
+
+    DNS["BOOT-003<br/>Bootstrap DNS Service<br/>Container / Auto-Start<br/>TO VERIFY IN LAB"]
+
+    NGINX["BOOT-004A<br/>Nginx Repository Service<br/>Container / Auto-Start<br/>TO VERIFY IN LAB"]
+
+    REPO["BOOT-004B<br/>Approved Offline VCF Repository<br/>CONFIRMED REQUIREMENT"]
+
+    CONFIG["BOOT-002<br/>Approved VCF Deployment JSON<br/>TO VERIFY IN LAB"]
+
+    SECRETS["BOOT-006<br/>Recovery Credentials / Secrets<br/>TO VERIFY IN LAB"]
+
+    PROVENANCE["PROV-001<br/>Signed Build Provenance Manifest<br/>TO VERIFY IN LAB"]
+
+    OPERATOR["BOOT-007<br/>NOC Recovery Interface<br/>TO VERIFY IN LAB"]
+
+    BOUNDARY --> RECOVERY
+
+    RECOVERY --> DNS
+    RECOVERY --> NGINX
+    NGINX --> REPO
+
+    PRODREPO --> REPO
+    APPROVED --> CONFIG
+    APPROVED --> PROVENANCE
+
+    CONFIG --> RECOVERY
+    SECRETS --> RECOVERY
+    PROVENANCE --> RECOVERY
+
+    RECOVERY --> OPERATOR
+
+
+    %% =========================================================
+    %% VCF INSTALLER / RECOVERY
+    %% =========================================================
+
+    PREFLIGHT["REC-001<br/>Automated Foundation Preflight<br/>TO VERIFY IN LAB"]
+
+    INSTALLER["VCF-001<br/>VCF Installer Appliance<br/>CONFIRMED"]
+
+    VALIDATE["VCF-002<br/>Installer JSON / SDDC Validation<br/>CONFIRMED"]
+
+    BUILD["VCF-003<br/>VCF 9 Deployment"]
+
+    POST["VCF-004<br/>Automated Post-Build Validation<br/>TO VERIFY IN LAB"]
+
+    VERIFYPROV["PROV-007<br/>Deployment Provenance Verification<br/>TO VERIFY IN LAB"]
+
+    FINALREPORT["REC-002<br/>Recovery Verification Report<br/>TO VERIFY IN LAB"]
+
+    VCF["VCF-005<br/>VCF 9 OPERATIONAL<br/>VALIDATED TARGET STATE"]
+
+    OPERATOR --> PREFLIGHT
+
+    ESXI --> PREFLIGHT
+    NET --> PREFLIGHT
+    STORAGE --> PREFLIGHT
+    NTP --> PREFLIGHT
+    DNS --> PREFLIGHT
+    REPO --> PREFLIGHT
+    CONFIG --> PREFLIGHT
+    SECRETS --> PREFLIGHT
+
+    PREFLIGHT --> INSTALLER
+
+    DNS --> INSTALLER
+    REPO --> INSTALLER
+    CONFIG --> INSTALLER
+    NTP --> INSTALLER
+    ESXI --> INSTALLER
+    STORAGE --> INSTALLER
+    NET --> INSTALLER
+
+    INSTALLER --> VALIDATE
+    VALIDATE --> BUILD
+    BUILD --> POST
+    POST --> VERIFYPROV
+    PROVENANCE --> VERIFYPROV
+    VERIFYPROV --> FINALREPORT
+    FINALREPORT --> VCF
+
+
+    %% =========================================================
+    %% NEXT PHASE
+    %% =========================================================
+
+    CONTRACT["NEXT PHASE<br/>VCF Infrastructure Contract<br/>RKE2 Requirements<br/>NOT YET MODELED"]
+
+    VCF --> CONTRACT
+```
+
+There are now **three important paths** in this DAG.
+
+The first is the **software supply/promotion path**:
+
+**Broadcom → Candidate → Staging Repository → Automated Build/Test → Senior Verification → Witness Rebuild → Approved Baseline → Manual Air-Gap Transfer.**
+
+The second is the **Day-0 recovery path**:
+
+**ESXi/Foundation → Recovery VM → DNS/Nginx/Repository → Preflight → VCF Installer → VCF → Validation.**
+
+And the third is the **provenance path**:
+
+**Approved Baseline → Signed Provenance → Recovery Build → Provenance Verification → Recovery Report.**
+
+One thing I intentionally modeled as separate nodes is:
+
+```text
+BOOT-004
+Offline VCF Software Repository
+        ↑
+BOOT-004A
+Repository Service
+        ↑
+Nginx
+```
+
+Conceptually, **the repository is the requirement; Nginx is our implementation**. If we eventually decide Apache, another HTTP server, or a Broadcom-supported depot appliance is better, the DAG dependency doesn't change.
+
+I'd also keep the **staging repository and production recovery repository logically separate**, even if they're constructed from identical automation. The staging repository can contain `CANDIDATE` artifacts. The production recovery repository should contain **only `APPROVED` baselines that crossed the manual air-gap release gate**.
+
+This is probably the first version of the VCF DAG I'd actually reproduce in Visio because the two halves—**continuously prove we can recover** and **actually recover at 01:00**—are now visible in the same dependency model.
+
+---
+Done. I regenerated the Excel DAG/register as **v0.2** to incorporate the self-hosted repository and the release/recovery governance model.
+
+[Download VCF9 Day-0 Recovery DAG Register v0.2](sandbox:/mnt/data/VCF9_Day0_Recovery_DAG_Register_v0.2.xlsx)
+
+The updated workbook now includes the existing VCF DAG/register plus the **Nginx self-hosted staging and production repositories, Candidate → Validated → Approved promotion process, automated clean rebuild and verification report, senior-engineer and witness gates, manual air-gap transfer, NOC recovery interface/guardrails, signed provenance, hidden build serial/canary, rollback baselines, and failed-preflight blocking**.
+
+I also added a dedicated **Release Pipeline** worksheet so we can track the normal lifecycle separately from Tests 1–4:
+
+**Broadcom candidate → staging → integrity verification → self-hosted repository → automated rebuild → automated report → senior review → witness rebuild → signed approved baseline → manual air-gap transfer → production repository → offline verification.**
+
+The **Relationships** sheet was expanded as well, so when you rebuild the diagram in Visio you'll have the new dependency edges available rather than having to derive them from the register.
+
+---
+
+Yes — and this may actually solve the immediate lab-capacity problem better than peeling four physical hosts away from OPS.
+
+### ESXi 8 → ESX 9
+
+There **is a supported direct upgrade path from vSphere/ESX 8.0 to 9.0**. Broadcom explicitly states that vSphere 9 supports direct upgrade from 8.0; direct upgrade from 7.0 is not supported. Existing 8.x hosts using baseline/VUM lifecycle management must transition to image-based lifecycle management for the 9.x upgrade. ([VMware Blogs][1])
+
+So you do **not** inherently need to wipe your existing ESXi 8 hosts and fresh-install 9.
+
+For **our production greenfield design**, though, I still like a clean ESX 9 installation when we eventually peel/reallocate hardware. That's not because Broadcom requires it; it's because our objective is a known, reproducible VCF foundation rather than carrying twelve years of configuration history forward.
+
+Also, Broadcom says most servers certified for vSphere/vSAN 8.x have been carried forward into VCF 9 where their underlying components remain supported. We still need to check your exact Dell blades, NICs/HBAs/storage against the current compatibility guide. ([VMware Blogs][2])
+
+### More importantly: nested ESX 9 is absolutely viable for our lab
+
+Broadcom engineers themselves use nested ESX for VCF 9 lab environments.
+
+In a 2026 Broadcom article describing a VCF 9 lab, the author says he had no physical hardware available, so he built **eight nested ESX host VMs**, including virtual disks for vSAN, and used that environment for VCF testing. ([VMware Blogs][3])
+
+So your physical lab could remain:
+
+```text
+Existing Physical Infrastructure
+
+        ESXi 8 Host(s)
+              │
+              │
+      ┌───────┼────────┐
+      │       │        │
+      ▼       ▼        ▼
+
+     VMs     VMs      VMs
+
+              │
+              ▼
+      VCF 9 Nested Lab
+```
+
+And inside that:
+
+```text
+                  Physical ESXi 8
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+        ▼               ▼               ▼
+   Recovery VM      Supporting       VCF Installer
+                    services
+                        │
+                        ▼
+             ┌──────────────────────┐
+             │ Nested ESX 9 Host 01 │
+             ├──────────────────────┤
+             │ Nested ESX 9 Host 02 │
+             ├──────────────────────┤
+             │ Nested ESX 9 Host 03 │
+             ├──────────────────────┤
+             │ Nested ESX 9 Host 04 │
+             └──────────────────────┘
+                        │
+                        ▼
+                   Nested vSAN
+                        │
+                        ▼
+                  VCF 9 Management
+                     Domain
+```
+
+That's actually quite close to what Broadcom engineers are doing for labs. ([VMware Blogs][3])
+
+### And yes — nested vSAN works
+
+For **lab/testing purposes**, yes.
+
+Broadcom's own VCF nested-lab material has historically used four nested ESXi hosts with virtual disks to create the VCF management-domain vSAN. ([VMware Blogs][4]) More recent VCF 9 material continues to discuss nested ESX lab configurations and virtual NVMe-backed devices. ([VMware Blogs][5])
+
+The distinction I'd put in our DAG is:
+
+**Production:** supported physical ESX/vSAN hardware.
+
+**Staging/lab:** nested ESX 9 + nested vSAN for functional/recovery testing.
+
+We're testing **reconstruction correctness**, not storage performance.
+
+---
+
+## This could actually improve our Test 1–4 methodology
+
+Instead of fighting OPS for four blades right now, I'd deliberately make the staging VCF environment disposable:
+
+```text
+                 PHYSICAL ESXi 8 LAB
+                         ↑
+              Nested Lab Foundation
+                         ↑
+        ┌────────┬───────┼───────┬────────┐
+        ↑        ↑       ↑       ↑        ↑
+      ESX9-01  ESX9-02 ESX9-03 ESX9-04 Recovery VM
+        │        │       │       │
+        └────────┴───┬───┴───────┘
+                     ↑
+                Nested vSAN
+                     ↑
+                VCF Installer
+                     ↑
+                  VCF 9
+```
+
+Now think about what that does to our CI/CD idea.
+
+The pipeline could potentially destroy and recreate the **entire nested environment**.
+
+```text
+New VCF candidate
+       ↑
+Build nested ESX 9 hosts
+       ↑
+Build nested vSAN
+       ↑
+Start Recovery VM
+       ↑
+Start DNS + Nginx depot
+       ↑
+Deploy VCF Installer
+       ↑
+Submit approved JSON
+       ↑
+Deploy VCF
+       ↑
+Validate
+       ↑
+Generate report
+       ↑
+DESTROY ENTIRE NESTED LAB
+```
+
+Then do it again.
+
+That is actually a **better automated recovery test** than using four persistent physical lab hosts, because every run can begin from an almost completely known state.
+
+There is one caveat: it proves the **VCF configuration and recovery process**, but it does not completely prove the production physical hardware path. Before production release I'd eventually want a smaller number of milestone builds performed against actual Dell hardware.
+
+So I'd distinguish two validation levels:
+
+**`LAB-VALIDATED`** — complete clean reconstruction succeeded on nested ESX/vSAN.
+
+**`HARDWARE-VALIDATED`** — reconstruction succeeded against the actual Dell/ESX/vSAN configuration intended for production.
+
+That distinction should go into our provenance manifest and verification report.
+
+And there's a nice consequence for our DAG: **the nested lab infrastructure belongs below the staging boundary, not inside the production VCF recovery DAG.** The production DAG stays exactly as we designed it; staging simply provides a virtual implementation of the same foundation contract.
+
+I think this is probably the direction I'd pursue before asking OPS to surrender four production-capable blades. It lets us start learning VCF 9, build the Recovery VM, develop the JSON, exercise nested vSAN, and hammer Tests 1–4 repeatedly **without touching their capacity at all**.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/06/23/vsphere-in-vcf-9-0-whats-new/?utm_source=chatgpt.com "What's New with vSphere in VMware Cloud Foundation 9.0? - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2026/02/25/vcf-9-0-server-certification-preserving-your-hardware-investment-and-giving-the-best-roi/?utm_source=chatgpt.com "VCF 9.0 Server Certification: Preserving Your Hardware Investment and giving the best ROI - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2026/04/16/converging-vmware-vsphere-to-vmware-cloud-foundation-9-0-the-top-10-questions-answered/?utm_source=chatgpt.com "Converging VMware vSphere to VMware Cloud Foundation 9.0: The Top 10 Questions Answered - VMware Cloud Foundation (VCF) Blog"
+[4]: https://blogs.vmware.com/cloud-foundation/2020/01/31/deep-dive-into-vmware-cloud-foundation-part-1-building-a-nested-lab/?utm_source=chatgpt.com "Deep dive into VMware Cloud Foundation - Part 1 Building a Nested Lab - VMware Cloud Foundation (VCF) Blog"
+[5]: https://blogs.vmware.com/cloud-foundation/2025/12/29/nvme-memory-tiering-design-and-sizing-on-vmware-cloud-foundation-9-part-5/?utm_source=chatgpt.com "NVMe Memory Tiering Design and Sizing on VMware Cloud Foundation 9 Part 5: Deployment Scenarios (Greenfield, Brownfield, Nested Lab) - VMware Cloud Foundation (VCF) Blog"
+
+
+---
+
+Agreed. That gives us a clean distinction: **the current objective is to prove the architecture and reconstruction model, not certify the eventual production hardware.**
+
+I would formally add one assumption to the register:
+
+> **`FND-LAB-001 — Nested VCF Validation Foundation — CONFIRMED`**
+> During architecture development, VCF 9 will be deployed on nested ESX 9 hosts with nested vSAN running on existing ESXi 8 lab infrastructure. This environment is used to prove deployment, IaC, repository, recovery, validation, provenance, and release processes. Physical hardware validation will occur as a separate gate before production implementation.
+
+That means our near-term test environment becomes:
+
+```text
+                 EXISTING LAB ESXi 8
+                         ↑
+══════════════ LAB FOUNDATION BOUNDARY ══════════════
+                         ↑
+             Automated Nested Foundation
+                         ↑
+        ┌────────────────┼────────────────┐
+        │                │                │
+    ESX 9 x4       Nested vSAN       Recovery VM
+        │                                 │
+        │                        ┌────────┼────────┐
+        │                        │        │        │
+        │                       DNS     Nginx    IaC
+        │                                 │
+        │                           VCF Repository
+        │                                 │
+        └────────────────┬────────────────┘
+                         ↑
+                   VCF Installer
+                         ↑
+                 Deployment JSON
+                         ↑
+                     VCF 9
+                         ↑
+              Automated Validation
+                         ↑
+               Provenance / Report
+```
+
+And now we can be fairly aggressive with the lab. **Destroying it is a feature.**
+
+A successful build isn't particularly interesting after the first couple of runs. What we're ultimately trying to prove is:
+
+> Starting with nothing but the declared foundation, approved artifacts and protected secrets, can the process repeatedly create the same validated VCF environment without an engineer making architectural decisions during deployment?
+
+That also gives us a progression for evidence: **Functional Validation** proves VCF can be built; **Reconstruction Validation** proves it can be destroyed and reproducibly rebuilt; **Operator Validation** proves the NOC can initiate it without engineering knowledge; **Release Validation** proves candidate → automated build → engineer verification → approved baseline → air-gap transfer; and later **Hardware Validation** repeats the process on the actual four compatible physical hosts.
+
+Only that last stage requires us to negotiate hardware with OPS.
+
+There's another benefit: because the **nested foundation itself can eventually be automated**, we can test more than VCF. We can deliberately inject failures—bad DNS, missing PTR, corrupted binary, wrong checksum, unreachable NTP, altered JSON, missing credential, failed ESX host—and prove the automation **refuses to proceed safely** and produces a useful report.
+
+That's arguably as important as proving the happy path.
+
+So I would keep the production DAG we already created intact and add a **Lab Validation DAG/register section underneath/alongside it**. We don't want nested ESX to accidentally become an architectural production dependency.
+
+Our immediate engineering sequence is now very concrete:
+
+**Build nested ESX 9 ×4 → establish nested vSAN → deploy VCF Installer manually → Test #1 → capture JSON/dependencies → Test #2 → build Recovery VM/DNS/Nginx → Test #3 → automate → Test #4 → destroy/recover repeatedly → automate candidate validation → NOC operator test → failure injection → eventually physical hardware validation.**
+
+That's enough to keep us busy for a while — and almost every unknown currently sitting in the Excel workbook should naturally turn into either **CONFIRMED** or **DISCOVERED DURING BUILD** as we go through it.
+ 
+ ---
+
+ Yes. And there is one important correction to the mental model before the walkthrough:
+
+**For our greenfield VCF 9 test, do not build the vSAN cluster manually first.** We create four nested ESX 9 hosts and present appropriate virtual disks to each host. The **VCF Installer creates/configures the management cluster and vSAN as part of VCF bring-up** when we select vSAN as the management-cluster storage. Broadcom describes a new VCF deployment as a minimum four-host management cluster using vSAN, NFS, or FC/VMFS, with vSAN Ready Nodes recommended. ([VMware Blogs][1])
+
+That's perfect for our recovery test because **vSAN itself becomes part of what VCF reconstructs**, rather than an undocumented prerequisite we manually created.
+
+## 1. What we're actually building
+
+I'd use this topology:
+
+```text
+                    EXISTING LAB
+              vCenter + ESXi 8 Cluster
+                         │
+            Existing physical datastore
+                         │
+        ┌────────────────┼─────────────────┐
+        │                │                 │
+        ▼                ▼                 ▼
+ Recovery/IaC VM    VCF Installer      Nested Lab
+ DNS + Nginx                             │
+ VCF Depot                               │
+                                        │
+                   ┌────────┬────────┬───┴────┐
+                   │        │        │        │
+                   ▼        ▼        ▼        ▼
+                ESX9-01  ESX9-02  ESX9-03  ESX9-04
+                   │        │        │        │
+                virtual  virtual  virtual  virtual
+                 disks    disks    disks    disks
+                   │        │        │        │
+                   └────────┴───┬────┴────────┘
+                                │
+                       VCF Installer creates
+                         management vSAN
+                                │
+                                ▼
+                          VCF 9 Management
+                              Cluster
+                                │
+             ┌──────────────────┼──────────────────┐
+             ▼                  ▼                  ▼
+          vCenter              NSX          VCF Operations
+                                                  │
+                                           VCF Automation
+```
+
+Nested ESX is a legitimate way to learn/test this architecture; Broadcom published a recent VCF 9 example where its engineer built eight nested ESX VMs with virtual drives for vSAN because physical hardware wasn't available. ([VMware Blogs][2])
+
+---
+
+# 2. Before downloading anything: choose one exact VCF release
+
+This is important.
+
+Don't independently decide:
+
+> ESX latest + NSX latest + vCenter latest + VCF latest.
+
+Treat VCF as a **validated BOM**.
+
+For example, if we select a particular VCF 9.0.x release, download the component versions/bundles associated with **that exact VCF release**.
+
+There are even release-specific Installer considerations. Broadcom currently says that within the 9.0 family, VCF Installer 9.0.2 should be used for deployments, with additional bundles required when targeting earlier 9.0 releases. 
+
+Given that VCF 9.1 is now GA, I wouldn't arbitrarily pick 9.0.0 simply because we've been calling the project "VCF 9." ([VMware Blogs][3])
+
+For the first lab, I'd pick **one currently supported VCF 9.x release**, freeze it, and call it something like:
+
+```text
+LAB BASELINE 001
+
+VCF release:       9.x.x
+VCF Installer:     corresponding supported release
+ESX:               BOM-defined version
+vCenter:           BOM-defined version
+NSX:               BOM-defined version
+vSAN:              ESX/vCenter integrated version
+VCF Operations:    BOM-defined version
+VCF Automation:    BOM-defined version
+```
+
+Then don't change versions until Test #1 succeeds.
+
+---
+
+# 3. Binaries/artifacts we need
+
+There's an important distinction in your question:
+
+### vSAN doesn't have a separate "vSAN ISO"
+
+vSAN is integrated into ESX/vSphere. We're not going to download:
+
+```text
+ESX.iso
+vSAN.iso
+```
+
+and install them separately.
+
+The main artifact categories for our lab are approximately:
+
+| Artifact                                |                                     Need | Purpose                             |
+| --------------------------------------- | ---------------------------------------: | ----------------------------------- |
+| **VCF Installer appliance OVA**         |                                  **Yes** | Day-0 VCF deployment engine         |
+| **ESX 9 installer ISO**                 |                                  **Yes** | Install nested ESX hosts            |
+| **ESX 9 offline depot/bundle ZIP**      | **Yes for repository/lifecycle testing** | Depot/vLCM/VCF lifecycle            |
+| **vCenter Server appliance ISO/bundle** |                 **Yes in VCF depot/BOM** | VCF deploys management vCenter      |
+| **NSX appliance/bundle**                |                 **Yes in VCF depot/BOM** | VCF deploys management-domain NSX   |
+| **VCF Operations bundle/appliance**     |                                  **Yes** | VCF operations/fleet management     |
+| **VCF Automation bundle/appliance**     |               **Yes for full VCF stack** | Automation/self-service component   |
+| **SDDC Manager bundle/appliance**       |                       **Yes in VCF BOM** | VCF instance component              |
+| **vSAN separate ISO**                   |                                   **No** | vSAN is integrated with vSphere/ESX |
+| **VCF Download Tool**                   |                                  **Yes** | Populate/manage offline depot       |
+| **VCF metadata/catalog files**          |                                  **Yes** | Depot/BOM/component discovery       |
+| **Deployment JSON**                     |                      **Generated by us** | Desired VCF configuration           |
+
+Broadcom says the VCF Installer deploys the stack including vCenter, NSX, VCF Operations and VCF Automation; SDDC Manager is also installed as a VCF 9 component. ([VMware Blogs][1])
+
+**I would not manually hunt down every appliance OVA individually if the VCF Download Tool can populate the appropriate release into our depot.**
+
+That's actually one of the first things we should learn in Test #1.
+
+Broadcom's offline-depot procedure says to download the **VCF Download Tool** from Broadcom Support Portal → VMware Cloud Foundation → Drivers & Tools. The package includes the VCF Download Tool and bundle-transfer utility. 
+
+The depot also isn't merely a directory full of ISOs. VCF 9 uses metadata including `productVersionCatalog.json` and `vcfManifest.json` to recognize binaries, compatibility and HCL information. 
+
+That reinforces our Nginx design:
+
+```text
+Recovery VM
+│
+└── Nginx :443
+     │
+     └── /vcf-depot/
+          │
+          ├── metadata/
+          │    ├── productVersionCatalog.json
+          │    └── vcfManifest.json
+          │
+          ├── ESX
+          ├── vCenter
+          ├── NSX
+          ├── Operations
+          ├── Automation
+          └── other BOM artifacts
+```
+
+And Broadcom requires the offline web server to support TLS 1.2/1.3; their guidance calls for substantial storage, potentially up to/about 1 TB depending on downloaded bundles. 
+
+---
+
+# 4. Prepare the outer ESXi 8 environment
+
+We don't modify the production design.
+
+On the **existing lab ESXi 8 cluster**, create a dedicated nested-VCF area.
+
+I would create something conceptually like:
+
+```text
+VCF9-LAB
+│
+├── VCF9-MGMT
+├── VCF9-VMOTION
+├── VCF9-VSAN
+├── VCF9-TEP
+└── VCF9-UPLINK
+```
+
+Whether these are separate VLANs immediately or initially collapsed in the nested lab is something I'd let Test #1 determine from the VCF planning requirements.
+
+For our architecture proof, though, I'd lean toward emulating the eventual logical separation rather than making everything one subnet.
+
+---
+
+# 5. Enable nested virtualization
+
+For each nested ESX VM, expose hardware-assisted virtualization to the guest.
+
+In vSphere this is the equivalent of enabling:
+
+**Expose hardware-assisted virtualization to the guest OS.**
+
+The physical CPUs must support the required virtualization extensions.
+
+The nested ESX VM is now essentially pretending to be one of our future Dell servers.
+
+---
+
+# 6. Create ESX9-01
+
+Do the first one manually.
+
+Something conceptually like:
+
+```text
+VM Name:
+ESX9-01
+
+Guest:
+VMware ESXi / ESX 9.x
+
+CPU:
+16-24 vCPU       <-- starting lab sizing, not production sizing
+
+Memory:
+64-128 GB        <-- VCF appliances will make memory the painful part
+
+Boot Disk:
+32-64 GB
+
+vSAN disks:
+Disk 1
+Disk 2
+Disk 3
+etc.
+
+NICs:
+2+ virtual NICs
+```
+
+I don't want to pretend those CPU/RAM numbers are Broadcom minimums—they're **starting lab sizing guesses**. Our actual sizing should come from the VCF 9 planning tool/BOM and the capacity available on your ESXi 8 cluster.
+
+The biggest constraint in nested VCF usually won't be disk.
+
+It'll be **RAM**.
+
+VCF 9's Simple appliance model still deploys at least seven management appliances: vCenter, SDDC Manager, NSX Manager, VCF Operations Manager, Fleet Management, Operations Collector and VCF Automation. ([VMware Blogs][1])
+
+So before creating the four nested hosts, we'll want to calculate total memory carefully.
+
+---
+
+# 7. Give each nested ESX host vSAN disks
+
+This is the answer to the vSAN question.
+
+Create virtual disks on each nested ESX VM, but **do not create the vSAN cluster yourself**.
+
+For example:
+
+```text
+ESX9-01
+├── Boot disk
+├── vSAN disk 1
+├── vSAN disk 2
+└── vSAN disk 3
+
+ESX9-02
+├── Boot disk
+├── vSAN disk 1
+├── vSAN disk 2
+└── vSAN disk 3
+
+ESX9-03
+...
+
+ESX9-04
+...
+```
+
+VCF will see these as local storage devices belonging to each ESX host.
+
+Broadcom's own nested-lab descriptions use virtual drives presented to the nested ESX hosts for vSAN storage. ([VMware Blogs][2])
+
+---
+
+# 8. Install ESX 9 on ESX9-01
+
+Mount the ESX 9 ISO.
+
+Install normally to the boot virtual disk.
+
+Configure:
+
+```text
+Hostname
+Management IP
+Subnet
+Gateway
+DNS
+NTP
+Root credential
+```
+
+For example:
+
+```text
+esx9-01.lab.tc.org
+esx9-02.lab.tc.org
+esx9-03.lab.tc.org
+esx9-04.lab.tc.org
+```
+
+Not suggesting those actual names—we'll define the real lab namespace before installation.
+
+---
+
+# 9. Clone or reproduce the remaining hosts
+
+For Test #1, cloning is perfectly reasonable.
+
+Eventually:
+
+```text
+nested-esx-template
+        │
+        ├── ESX9-01
+        ├── ESX9-02
+        ├── ESX9-03
+        └── ESX9-04
+```
+
+But each host must end up with unique:
+
+```text
+hostname
+management IP
+MAC addresses
+VM UUID
+storage identity
+```
+
+Eventually this becomes part of our staging automation:
+
+```text
+build-nested-foundation
+       ↓
+ESX9-01
+ESX9-02
+ESX9-03
+ESX9-04
+```
+
+---
+
+# 10. Don't create vCenter yet
+
+This is another important distinction.
+
+For **our greenfield test**, we're not building:
+
+```text
+ESX
+ ↓
+vCenter
+ ↓
+vSAN
+ ↓
+NSX
+ ↓
+VCF
+```
+
+We're preparing:
+
+```text
+4 x ESX
++
+local disks
++
+network
++
+DNS/NTP
++
+VCF software depot
+        ↓
+VCF Installer
+```
+
+The Installer creates the VCF management environment.
+
+Broadcom specifically says a new VCF deployment can deploy new VM appliances for **vCenter, NSX, VCF Operations and VCF Automation**. ([VMware Blogs][1])
+
+That's exactly the recovery behavior we want to prove.
+
+---
+
+# 11. Build the Recovery/IaC VM
+
+Now create:
+
+```text
+vcf-recovery-01
+```
+
+Initially I'd keep it simple:
+
+```text
+RHEL 9 / equivalent Linux
+│
+├── Podman
+│
+├── DNS container
+│
+├── Nginx container
+│
+├── VCF Download Tool
+│
+├── VCF depot storage
+│
+├── deployment JSON
+│
+└── validation scripts
+```
+
+We can decide later whether Ansible earns a place here.
+
+---
+
+# 12. Configure DNS
+
+The Recovery VM provides the temporary authoritative DNS capability we've already designed.
+
+Before touching VCF Installer:
+
+```text
+forward lookup:
+esx9-01 -> IP
+esx9-02 -> IP
+...
+
+reverse lookup:
+IP -> esx9-01
+IP -> esx9-02
+...
+```
+
+Then add all planned VCF appliance names.
+
+The important rule for Test #1:
+
+**Do not fix DNS silently.**
+
+Every record we discover VCF needs gets recorded in the DAG/register.
+
+---
+
+# 13. Configure Nginx offline depot
+
+This is where our earlier architecture starts becoming real.
+
+Use HTTPS, not plain HTTP. Broadcom's offline depot requirements call for TLS 1.2/1.3, and VCF 9 lifecycle workflows expect the offline repository correctly populated and reachable; Broadcom documents failures when an offline depot is incorrectly configured on port 80 instead of 443. 
+
+Conceptually:
+
+```text
+https://vcf-repo.lab.tc.org/
+```
+
+served by:
+
+```text
+Recovery VM
+   ↓
+Podman
+   ↓
+Nginx
+   ↓
+VCF Depot
+```
+
+---
+
+# 14. Populate the depot
+
+In staging, where you have restricted Internet access:
+
+```text
+Broadcom
+    ↓
+VCF Download Tool
+    ↓
+candidate/
+    ↓
+integrity validation
+    ↓
+VCF Depot
+```
+
+Use the tool to retrieve the selected **VCF release BOM**, rather than assembling random component versions manually.
+
+That's also the seed of our future CI/CD process.
+
+---
+
+# 15. Deploy VCF Installer
+
+Deploy the VCF Installer OVA onto the **outer ESXi 8 lab environment**, not inside one of the four nested ESX hosts.
+
+Conceptually:
+
+```text
+Outer ESXi 8
+│
+├── Recovery VM
+├── VCF Installer
+│
+├── Nested ESX9-01
+├── Nested ESX9-02
+├── Nested ESX9-03
+└── Nested ESX9-04
+```
+
+That way, destroying the nested VCF management domain doesn't destroy the thing responsible for rebuilding it.
+
+That's exactly analogous to our production recovery architecture.
+
+---
+
+# 16. Point VCF Installer at the repository
+
+Configure the Installer to consume our Nginx-hosted private depot.
+
+Then confirm that it can see the selected VCF release and all required components.
+
+This is a major Test #1 checkpoint:
+
+```text
+Installer
+   ↓
+DNS ........ PASS
+NTP ........ PASS
+Depot ...... PASS
+ESX hosts .. PASS
+Artifacts .. PASS
+```
+
+If it can't see a component, **don't manually upload it and forget about it**.
+
+That's a `DISCOVERED DURING BUILD` entry.
+
+---
+
+# 17. Start the greenfield VCF deployment
+
+Choose:
+
+**Deploy new VCF instance / new fleet**
+
+rather than converge/import.
+
+Provide the four nested ESX hosts.
+
+Select **vSAN** as management storage.
+
+At this point:
+
+> **VCF Installer creates/configures vSAN.**
+
+We gave it disks.
+
+VCF owns the configuration.
+
+That is exactly what we want to test.
+
+---
+
+# 18. Let VCF build the stack
+
+Conceptually the Installer now turns:
+
+```text
+4 naked ESX hosts
++
+disks
++
+network
++
+DNS
++
+NTP
++
+VCF binaries
++
+deployment specification
+```
+
+into:
+
+```text
+              VCF MANAGEMENT DOMAIN
+
+                 vCenter
+                    │
+              Management Cluster
+                    │
+                  vSAN
+                    │
+                   NSX
+                    │
+               SDDC Manager
+                    │
+              VCF Operations
+                    │
+              Fleet Management
+                    │
+              VCF Automation
+```
+
+A new VCF management domain is configured for NSX automatically. ([VMware Blogs][1])
+
+---
+
+# 19. Capture the JSON
+
+During this first interactive deployment, we're learning.
+
+At the end:
+
+```text
+VCF #1
+   ↓
+known-good configuration
+   ↓
+vcf-deployment.json
+```
+
+Archive that.
+
+This becomes the starting point for Test #2.
+
+---
+
+# 20. Validate VCF #1
+
+Now capture:
+
+```text
+vCenter health
+ESX host membership
+vSAN health
+NSX health
+VCF Operations health
+SDDC Manager health
+VCF Automation health
+DNS
+NTP
+component versions
+VCF BOM
+network configuration
+```
+
+Generate:
+
+```text
+TEST-001-REPORT
+```
+
+And mark every discovered requirement in our Excel register.
+
+---
+
+# 21. Then destroy it
+
+This is the fun part.
+
+Not the outer ESXi 8 lab.
+
+Destroy:
+
+```text
+Nested VCF
+Nested vCenter
+Nested NSX
+Nested vSAN configuration
+VCF management appliances
+```
+
+Return to:
+
+```text
+Outer ESXi 8
+      │
+      ├── Recovery VM
+      ├── VCF Installer
+      │
+      ├── ESX9-01
+      ├── ESX9-02
+      ├── ESX9-03
+      └── ESX9-04
+```
+
+Then Test #2 begins.
+
+Eventually we destroy the nested ESX hosts too and prove we can recreate **those**.
+
+---
+
+## What I would download first
+
+Don't download everything VMware has.
+
+Start with this shopping list:
+
+1. **Selected VCF 9.x release entitlement/evaluation access**
+2. **VCF Installer OVA**
+3. **ESX 9 ISO**
+4. **ESX 9 offline depot ZIP**
+5. **VCF Download Tool**
+6. **The complete VCF installation binaries/BOM for the selected VCF release**, populated into our private depot using the Download Tool
+7. **Associated VCF metadata/catalog files**
+8. **Current documentation/release notes and checksums**
+
+The depot/BOM should then provide the required versions of **vCenter, NSX, SDDC Manager, VCF Operations and VCF Automation** rather than us independently selecting them. There is **no separate vSAN ISO** for this purpose.
+
+[Broadcom VCF 9 Deployment Pathways](https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com)
+
+[Broadcom VCF Offline Depot procedure](https://knowledge.broadcom.com/external/article?legacyId=95552&utm_source=chatgpt.com)
+
+One more thing I spotted that I want on our Test #1 radar: the VCF Installer has a precheck requiring **10-Gbps management NIC speed**, at least in documented VCF/VVF Installer validation.  With nested ESX, the way the virtual NIC reports its speed may therefore matter. I wouldn't redesign anything yet, but I'd add **`LAB-009 — Nested ESX vmnic speed passes VCF Installer 10-Gbps validation`** as `TO VERIFY IN LAB`. That's exactly the kind of nested-vs-physical wrinkle our first build should expose.
+
+Once you pick the exact VCF release you're downloading—**9.0.2, 9.1.x, etc.**—I can make the next pass much more mechanical: exact VM sizing, virtual disk layout, port groups/VLANs, IP/FQDN inventory, and the precise build order for `ESX9-01` through `ESX9-04`.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/?utm_source=chatgpt.com "Deployment Pathways for VMware Cloud Foundation 9 - VMware Cloud Foundation (VCF) Blog"
+[2]: https://blogs.vmware.com/cloud-foundation/2026/04/16/converging-vmware-vsphere-to-vmware-cloud-foundation-9-0-the-top-10-questions-answered/?utm_source=chatgpt.com "Converging VMware vSphere to VMware Cloud Foundation 9.0: The Top 10 Questions Answered - VMware Cloud Foundation (VCF) Blog"
+[3]: https://blogs.vmware.com/cloud-foundation/2026/05/12/vcf-9-1-is-available-explore-the-new-features-in-hands-on-labs/?utm_source=chatgpt.com "VCF 9.1 is Available: Explore the New Features in Hands-on Labs - VMware Cloud Foundation (VCF) Blog"
+
+
+---
+
+Yes. **VCF 9.1.1 is a sensible fixed baseline for this project**, especially given that we're expecting months of lab work rather than trying to chase releases during Tests 1–4.
+
+One date correction before we lock it into the DAG: Broadcom's current release table lists **VCF 9.1.1 GA as September 3, 2026**, not August 26. Broadcom's announcement is also dated September 3. ([VMware Blogs][1])
+
+More importantly, starting with VCF 9, Broadcom moved the VCF components onto a common versioning/release convention, so using **9.1.1 as our baseline** gives us a cleaner BOM concept than older VCF releases.  NSX 9.1.1, for example, is also listed as released September 3, build 25691509. 
+
+I'd freeze the lab definition as:
+
+```text
+VCF LAB BASELINE 001
+
+Platform Baseline:     VMware Cloud Foundation 9.1.1
+Release Date:           03 September 2026
+Validation Model:       Nested ESX 9.1.1 / Nested vSAN
+Outer Hypervisor:       Existing ESXi 8 lab cluster
+
+Purpose:
+  Architecture validation
+  Day-0 reconstruction validation
+  Offline repository validation
+  IaC/recovery validation
+  NOC/operator validation
+  Failure-injection validation
+
+NOT:
+  Production hardware validation
+```
+
+And this actually makes our repository/provenance design even more important. We should **not update this lab baseline every time Broadcom releases 9.1.1.x/9.1.2/9.2 or a security patch while we're developing the initial process**.
+
+Instead:
+
+```text
+VCF 9.1.1
+    │
+    ▼
+BASELINE-001
+    │
+    ├── Test 1
+    ├── Test 2
+    ├── Test 3
+    ├── Test 4
+    ├── Repeat Recovery
+    ├── NOC Test
+    └── Failure Injection
+             │
+             ▼
+      ARCHITECTURE PROVEN
+```
+
+A newer Broadcom release becomes a **candidate**, not an automatic replacement:
+
+```text
+VCF 9.1.2 / future update
+          │
+          ▼
+      CANDIDATE-002
+          │
+          ▼
+automated nested reconstruction
+          │
+          ▼
+ automated validation
+          │
+          ▼
+ engineering review
+          │
+          ▼
+ approved new baseline
+```
+
+That's exactly the lifecycle we've been designing.
+
+One thing we should account for when I produce the **exact 9.1.1 build guide**: VCF 9.1 introduced mandatory **VCF Management Services**, and Broadcom says that layer requires a minimum of **12 IP addresses**, with another 18 potentially added for additional scenarios.  That's the kind of 9.1-specific requirement that needs to get captured before we lay out our nested networks/IP plan.
+
+So from here forward, I'll treat **VCF 9.1.1 as `LAB-BASELINE-001`** unless we explicitly decide to change it.
+
+The next useful deliverable is therefore no longer a generic VCF 9 walkthrough. It should be a **VCF 9.1.1-specific Nested Lab Build Book**: exact Broadcom 9.1.1 artifacts/BOM, four nested ESX VM specifications, virtual disks for vSAN, nested networking/port groups, IP/FQDN worksheet, DNS records, VCF Management Services addresses, Recovery VM, Nginx depot layout, VCF Installer, and then the exact Test 0 → Test 1 execution sequence. That would give you something you can actually sit beside the keyboard and work through when the downloads are ready.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2026/09/03/announcing-general-availability-of-vmware-cloud-foundation-9-1-1/?utm_source=chatgpt.com "Announcing General Availability of VMware Cloud Foundation 9.1.1 - VMware Cloud Foundation (VCF) Blog"
+
+---
+
+Perfect. That removes one of the bigger constraints and lets us treat this as a **self-contained VCF 9.1.1 recovery sandbox** rather than trying to fit it into existing enterprise addressing.
+
+I would make that an explicit lab assumption:
+
+**`FND-LAB-002 — Isolated Nested VCF Sandbox — CONFIRMED`**
+The VCF 9.1.1 nested validation environment resides on isolated lab port groups with unrestricted private IP allocation inside the sandbox. Administrative access originates through a jump box connected to an authorized sandbox port group. The sandbox does not depend on production DNS, AD, Keycloak, routing, or other enterprise services for VCF reconstruction.
+
+That lets us deliberately design the sandbox from scratch:
+
+```text
+                         JUMP BOX
+                            │
+                     Admin Port Group
+                            │
+═══════════════ VCF 9.1.1 SANDBOX ═══════════════
+                            │
+                     Recovery / IaC VM
+                    DNS + Nginx + Tools
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+       VCF Mgmt          vMotion           vSAN
+          │                 │                 │
+          ├───────┬─────────┼─────────┬───────┤
+          │       │         │         │       │
+       ESX9-01 ESX9-02   ESX9-03   ESX9-04
+          │       │         │         │
+          └───────┴─────────┴─────────┘
+                            │
+                       VCF Installer
+                            │
+                   VCF 9.1.1 Management
+                         Environment
+```
+
+### This changes how I'd build the lab
+
+Since addresses are essentially free inside the sandbox, **I would not collapse everything onto one subnet just because it's nested**. Let's make the nested environment resemble the logical network dependencies we're ultimately trying to prove.
+
+For example, we can reserve clean RFC1918 blocks for **jump/admin access, ESX/VCF management, vMotion, vSAN, NSX TEP, VCF Management Services, and later workload/RKE2 networks**. The exact CIDRs don't matter yet; we'll size them against the 9.1.1 requirements before assigning anything.
+
+The Recovery VM becomes especially interesting because it can be deliberately dual-homed if necessary:
+
+```text
+Jump/Admin PG
+     │
+     ▼
+Recovery VM
+     │
+     ├── DNS
+     ├── Nginx VCF Depot
+     ├── VCF tooling
+     ├── deployment JSON
+     ├── validation
+     └── recovery orchestration
+     │
+     ▼
+VCF Management PG
+```
+
+But I'll avoid dual-homing it unless we actually need it. A routed/firewalled sandbox design is preferable if the lab infrastructure supports it.
+
+### And this gives us a very clean recovery test
+
+After Test #1, enterprise infrastructure becomes irrelevant to the experiment except for the physical substrate and your entry point.
+
+We can establish the rule:
+
+> **If I disconnect the sandbox from everything except my authorized jump-box path, can I reconstruct VCF 9.1.1?**
+
+That means no corporate DNS, no AD, no Keycloak, no GitLab, no Internet, no existing vCenter *inside the sandbox*, no RKE2 and no external repository.
+
+The outer ESXi 8/vCenter environment is merely providing the virtual equivalent of our assumed physical foundation.
+
+That is a very strong approximation of the cyber-recovery scenario we're trying to engineer.
+
+And because you have free addressing, we can also deliberately wreck things later: delete PTRs, change DNS answers, block a management flow, make NTP unreachable, remove a depot artifact, alter a checksum, change the deployment JSON, kill the DNS container, or remove one nested ESX host. Then we find out whether our preflight catches the problem **before VCF deployment begins**.
+
+I'll use this sandbox assumption when we build the **9.1.1 Nested Lab Build Book**. That means we can give it a complete deterministic IP/FQDN/network layout rather than leaving a bunch of “choose an available subnet” placeholders.
+
+---
+
+Built it. I turned what we've established into a working **VCF 9.1.1 Nested Lab Build Book v0.1** rather than just another conceptual outline.
+
+[Download the VCF 9.1.1 Nested Lab Build Book v0.1](sandbox:/mnt/data/VCF_9.1.1_Nested_Lab_Build_Book_v0.1.docx)
+
+It's an 11-page build document covering the isolated sandbox architecture, proposed deterministic network/IP plan, four nested ESX 9.1.1 hosts, nested vSAN approach, Recovery/IaC VM, bootstrap DNS, Nginx HTTPS depot, VCF Installer, artifact/download manifest, Test 0 through Test 4+, failure injection, provenance, Gate A, and the mandatory physical-hardware validation before Gate B/production.
+
+I also made the **OPS download checklist** explicit. One useful 9.1-specific finding while researching this: the VCF Download Tool's default `INSTALL` query does **not** necessarily return every component, and ESX installation media is deliberately handled separately because VCFDT isn't the bare-metal ESX installer. Broadcom documents explicit component queries for things such as `VCENTER`, `NSX_T_MANAGER`, `SDDC_MANAGER_VCF`, `VROPS`, `VRA`, `VSP`, etc. 
+
+Also captured in the book: VCF 9.1 depot authentication uses a **Software Depot ID + Activation Code**, replacing the older download-token model.  The offline depot needs the metadata/catalog/HCL information in addition to binaries and should be served over TLS 1.2/1.3; Broadcom recommends planning substantial depot storage, potentially up to 1 TB depending on what we retain. 
+
+And I reserved **30 contiguous IPs** inside the proposed management subnet for VCF Management Services. Broadcom's minimum is 12, but it permits up to 30 and identifies the additional addresses for future components/scale-out. Since you have free range in the sandbox, there's little reason for us to paint ourselves into a corner with 12. 
+
+The nested approach itself remains well aligned with what we're trying to prove: Broadcom has documented its own engineers using nested ESX VMs with virtual disks for vSAN when physical hardware wasn't available, while a new VCF instance still has the four-host management-cluster requirement. ([VMware Blogs][1])
+
+Once OPS gets you the download path, **I would not jump straight into installing anything**. Bring me the filenames/version/build numbers they can see for 9.1.1. We can reconcile that actual download inventory against the build book first and create **Artifact Manifest 001**. That gives us the first real input to the provenance/recovery system rather than discovering halfway through Test 1 that we're missing a component.
+
+[1]: https://blogs.vmware.com/cloud-foundation/2026/04/16/converging-vmware-vsphere-to-vmware-cloud-foundation-9-0-the-top-10-questions-answered/?utm_source=chatgpt.com "Converging VMware vSphere to VMware Cloud Foundation 9.0: The Top 10 Questions Answered - VMware Cloud Foundation (VCF) Blog"
+
+---
+
 
